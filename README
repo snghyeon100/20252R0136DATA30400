@@ -1,0 +1,24 @@
+1. 데이터 분포 확인
+2. 프롬프트 템플릿
+templates = [
+    # 1. TaxoClass 원본 (Baseline)
+    "This product is about {}.",
+    
+    # 2. 직관적 분류형 (OpenPrompt 연구 등에서 효과적)
+    # 모델이 헤더나 라벨을 인식하는 방식을 모방
+    "Category: {}.",
+    
+    # 3. 최상위 개념 명시형 (계층 구조 강조)
+    # 하위 클래스가 '카테고리'의 일종임을 암시하여 모델의 혼동을 줄임
+    "It belongs to the {} category.",
+    
+    # 4. 리뷰 맥락 반영형 (PET, LM-BFF 스타일)
+    # Amazon 데이터셋이 '리뷰'라는 점을 명시
+    "A review of {}.",
+    
+    # 5. 주제 중심형 (일반적 NLI 성능 우수)
+    "The topic of this text is {}.",
+    
+    # 6. 객체 정의형 (짧고 강력함)
+    "It is a {}."
+]
