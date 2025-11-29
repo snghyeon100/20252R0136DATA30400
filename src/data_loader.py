@@ -77,6 +77,34 @@ class Taxonomy:
     def get_ancestors(self, class_id):
         """모든 조상 ID 반환 (재귀적)"""
         return list(nx.ancestors(self.graph, class_id))
+    
+    def get_adjacency_matrix(self, device):
+        """
+        GNN 학습용 인접 행렬 생성 (Self-loop + Normalization)
+        """
+        num_classes = len(self.id2name)
+        
+        # 1. 단위 행렬(Identity Matrix)로 초기화
+        # 대각선이 모두 1이므로 '나 자신 포함(Self-loop)' 문제가 자동으로 해결됩니다.
+        adj = torch.eye(num_classes, device=device)
+        
+        # 2. 그래프 연결 정보 채우기 (양방향)
+        # GNN에서는 정보가 부모<->자식 양방향으로 흘러야 하므로 둘 다 1로 설정합니다.
+        for u, v in self.graph.edges():
+            adj[u, v] = 1 
+            adj[v, u] = 1 
+            
+        # 3. 정규화 (Normalization)
+        # 친구가 많은 노드는 값이 너무 커지는 것을 방지하기 위해, 연결된 수만큼 나눠줍니다.
+        # (Row-normalization: D^-1 * A)
+        row_sum = adj.sum(dim=1, keepdim=True)
+        
+        # 0으로 나누는 에러 방지 (혹시 고립된 노드가 있다면)
+        row_sum[row_sum == 0] = 1 
+        
+        norm_adj = adj / row_sum
+        
+        return norm_adj
 
 class ReviewDataset(Dataset):
     """
