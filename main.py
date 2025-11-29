@@ -6,7 +6,7 @@ from src import config, utils
 from src.data_loader import Taxonomy, ReviewDataset
 from src.silver_labeler import SilverLabeler
 from src.model import DualEncoder
-from src.trainer import Trainer
+from src.early_stop import Trainer
 
 def main():
     # 1. 초기 설정
