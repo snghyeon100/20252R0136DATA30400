@@ -58,7 +58,7 @@ class Trainer:
         self.class_features = self._prepare_class_features()
         
         # Early Stopping 설정 (Patience=3: 3번 참아줌)
-        self.early_stopping = EarlyStopping(patience=3, path=config.MODEL_SAVE_PATH)
+        self.early_stopping = EarlyStopping(patience=4, path=config.MODEL_SAVE_PATH)
         
         # Loss Function
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')
