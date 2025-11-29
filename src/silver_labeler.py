@@ -5,6 +5,7 @@ import torch.nn as nn
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer, util
 from . import config
+import time
 """
 # OpenAI 라이브러리 안전 로드
 try:
@@ -173,7 +174,7 @@ class SilverLabeler:
 
         # Gemini 설정
         genai.configure(api_key=api_key)
-        model = genai.GenerativeModel('gemini-1.5-flash') # 무료이고 빠름
+        model = genai.GenerativeModel('gemini-2.5-flash') # 무료이고 빠름
         
         print(f"[SilverLabeler] Generating Data using Gemini API...")
         generated_data = {}
@@ -218,6 +219,7 @@ class SilverLabeler:
                 time.sleep(4) 
                     
             except Exception as e:
+                print(e, response.text[:200])
                 print(f"[Warning] Gemini call failed for batch {i}: {e}")
                 # 실패하면 Dummy 데이터로 채움 (멈추지 않음)
                 for cid, cname in batch:

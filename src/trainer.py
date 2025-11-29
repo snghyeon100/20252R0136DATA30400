@@ -7,6 +7,7 @@ import numpy as np
 from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
+import time
 from . import config, utils
 
 class EarlyStopping:
@@ -203,14 +204,9 @@ class Trainer:
             logits, proj_feat = self.model(input_ids, mask, self.class_features, self.adj_matrix)
             
             # 검증 Loss도 학습 모드와 동일하게 계산하여 비교
-            if mode == "supervised":
-                loss_cls = self._compute_taxonomy_aware_loss(logits, labels)
-                loss_con = self._compute_contrastive_loss(proj_feat, labels)
-                loss = loss_cls + (0.1 * loss_con)
-            else:
-                probs = torch.sigmoid(logits)
-                target_q = self._compute_target_q(probs)
-                loss = F.binary_cross_entropy_with_logits(logits, target_q)
+            loss_cls = self._compute_taxonomy_aware_loss(logits, labels)
+            loss_con = self._compute_contrastive_loss(proj_feat, labels)
+            loss = loss_cls + 0.1 * loss_con
                 
             total_loss += loss.item()
             
@@ -223,15 +219,27 @@ class Trainer:
         bce_loss = self.bce_loss(logits, silver_labels)
         mask = torch.ones_like(silver_labels)
         pred_indices = silver_labels.nonzero()
-        silver_labels_cpu = silver_labels.cpu()
+        
         for i in range(silver_labels.shape[0]):
-            core_classes = torch.where(silver_labels[i] == 1)[0].cpu().tolist()
+            core_classes = torch.where(silver_labels[i] == 1)[0].tolist()
             for c in core_classes:
                 children = self.taxonomy.get_children(c)
                 if children:
+                    children_tensor = torch.tensor(children, device=self.device)
                     mask[i, children] = 0.0
-        masked_loss = (bce_loss * mask).sum() / (mask.sum() + 1e-9)
-        return masked_loss
+        masked_loss_sum = (bce_loss * mask).sum()
+    
+        # 유효한 요소의 개수
+        valid_elements_count = mask.sum()
+        
+        # Loss 계산 (유효 요소의 평균)
+        # 1e-9 대신 0으로 나누는 경우만 방지
+        if valid_elements_count.item() == 0:
+            return torch.tensor(0.0, device=self.device)
+            
+        final_loss = masked_loss_sum / valid_elements_count
+
+        return final_loss
 
     def _compute_contrastive_loss(self, features, labels, temperature=0.07):
         # (이전과 동일)
