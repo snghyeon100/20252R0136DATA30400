@@ -25,6 +25,7 @@ TEST_CORPUS_PATH = os.path.join(RAW_DATA_DIR, "test", "test_corpus.txt")
 # 메타 데이터 경로
 TAXONOMY_PATH = os.path.join(RAW_DATA_DIR, "class_hierarchy.txt")
 KEYWORDS_PATH = os.path.join(RAW_DATA_DIR, "class_related_keywords.txt")
+CLASS_PATH = os.path.join(RAW_DATA_DIR, "classes.txt") 
 
 # 생성 파일 저장 경로 (중간 결과물)
 EXPANDED_KEYWORDS_PATH = os.path.join(OUTPUT_DIR, "keywords_expanded.json")
@@ -40,7 +41,7 @@ SUBMISSION_PATH = os.path.join(BASE_DIR, "submission.csv") # 학번_final.csv로
 # ==========================================
 NUM_CLASSES = 531
 MAX_SEQ_LEN = 128        # BERT 입력 최대 길이 (메모리 부족 시 줄임)
-BERT_MODEL_NAME = "bert-base-uncased"
+BERT_MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
 
 # Phase 1: Silver Label 생성용 NLI 모델 (논문 설정)
 NLI_MODEL_NAME = "roberta-large-mnli" 
