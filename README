@@ -22,3 +22,5 @@ templates = [
     # 6. 객체 정의형 (짧고 강력함)
     "It is a {}."
 ]
+3. 맨 처음 silver_label 설정 개발 과정 : first. 그냥 바로 SBERT? second. LLM 붙이자. Third. 기존 keyword 보고 LLM 붙이자.
+ 

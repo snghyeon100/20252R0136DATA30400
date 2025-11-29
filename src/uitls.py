@@ -60,7 +60,7 @@ def save_submission(pids, predictions, filename):
                 labels = labels.cpu().tolist()
             
             # 공백으로 구분하여 문자열로 변환 (예: "1 23 50")
-            label_str = " ".join(map(str, sorted(labels)))
+            label_str = ",".join(map(str, sorted(labels)))
             writer.writerow([pid, label_str])
             
     print(f"[Info] Submission file saved to {filename}")

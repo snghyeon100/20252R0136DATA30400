@@ -46,10 +46,10 @@ class GraphEncoder(nn.Module):
 
 class DualEncoder(nn.Module):
     """
-    [Main Brain] BERT + GNN 결합 모델 (TaxoClass Architecture)
+    [Main Brain] SBERT + GNN 결합 모델 (TaxoClass Architecture)
     
     구조:
-    1. Document Encoder (BERT): 리뷰 텍스트 -> 벡터
+    1. Document Encoder (SBERT): 리뷰 텍스트 -> 벡터
     2. Class Encoder (GNN): 텍스트 + 그래프 -> 벡터
     3. Interaction: 두 벡터의 내적(Dot Product)으로 분류 점수 계산
     4. Projection Head: 대조 학습(Contrastive Learning)을 위한 벡터 압축
@@ -57,7 +57,7 @@ class DualEncoder(nn.Module):
     def __init__(self, num_classes=config.NUM_CLASSES, hidden_dim=768):
         super(DualEncoder, self).__init__()
         
-        # 1. Document Encoder (BERT)
+        # 1. Document Encoder (SBERT)
         print(f"[Model] Loading Pretrained SBERT: {config.BERT_MODEL_NAME}...")
         self.bert = AutoModel.from_pretrained(config.BERT_MODEL_NAME)
         # -----------------------------------------------------------

@@ -5,14 +5,20 @@ import torch.nn as nn
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer, util
 from . import config
-
+"""
 # OpenAI 라이브러리 안전 로드
 try:
     from openai import OpenAI
 except ImportError:
     OpenAI = None
     print("[Warning] 'openai' library not found. LLM expansion will be skipped.")
-
+"""
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+    print("[Warning] 'google-generativeai' library not installed.")
 class SilverLabeler:
     """
     [Phase 1] 가상 정답(Silver Label) 생성기
@@ -60,12 +66,12 @@ class SilverLabeler:
         # 4. 결과 저장
         torch.save(self.silver_labels, config.SILVER_LABELS_PATH)
         print(f"[SilverLabeler] Silver labels saved to {config.SILVER_LABELS_PATH}")
-
+    """
     def _load_or_generate_llm_data(self):
-        """
+        
         [Enrichment] LLM을 사용하여 클래스 정보를 확장합니다.
         * Gap Filling Strategy: 기존 키워드를 프롬프트에 포함하여 중복 방지
-        """
+        
         # 1. 파일이 있으면 로드 (비용 절약)
         if os.path.exists(config.EXPANDED_KEYWORDS_PATH):
             print(f"[SilverLabeler] Loading LLM data from {config.EXPANDED_KEYWORDS_PATH}")
@@ -77,7 +83,7 @@ class SilverLabeler:
             return {}
 
         # API Key 확인 (환경변수 또는 하드코딩)
-        api_key = os.getenv("OPENAI_API_KEY") 
+        api_key = "os.getenv("OPENAI_API_KEY")" # 또는 여기에 직접 입력: "sk-..."
         if not api_key:
             print("[Error] OPENAI_API_KEY not found. Please set environment variable or edit code.")
             return {}
@@ -137,6 +143,89 @@ class SilverLabeler:
             except Exception as e:
                 print(f"[Warning] API call failed for batch {i}: {e}")
                 continue
+
+        # 결과 저장
+        with open(config.EXPANDED_KEYWORDS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(generated_data, f, indent=4)
+            
+        return generated_data
+    """
+    def _load_or_generate_llm_data(self):
+        """
+        Gemini API를 사용하여 키워드와 설명을 생성합니다.
+        키가 없으면 기본 데이터로 Fallback합니다.
+        """
+        if os.path.exists(config.EXPANDED_KEYWORDS_PATH):
+            print(f"[SilverLabeler] Loading existing LLM data...")
+            with open(config.EXPANDED_KEYWORDS_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+
+        # Gemini API Key 확인 (환경변수 또는 직접 입력)
+        api_key = os.getenv("OPENAI_API_KEY")# 또는 여기에 직접 입력: "AIzaSy..."
+        
+        if not HAS_GEMINI or not api_key:
+            print("\n" + "="*50)
+            print("[Info] No API Key found. Switching to DUMMY MODE.")
+            print("       This allows you to run the pipeline without an LLM.")
+            print("       (Only raw keywords will be used for description)")
+            print("="*50 + "\n")
+            return self._generate_dummy_data()
+
+        # Gemini 설정
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash') # 무료이고 빠름
+        
+        print(f"[SilverLabeler] Generating Data using Gemini API...")
+        generated_data = {}
+        all_classes = list(self.taxonomy.id2name.items())
+        
+        # 배치 사이즈 (Gemini는 무료 티어 Rate Limit이 분당 15회 정도임)
+        # 안전하게 10개씩 묶고, 루프마다 4초 쉬면 됨.
+        BATCH_SIZE = 10
+        
+        for i in tqdm(range(0, len(all_classes), BATCH_SIZE), desc="Gemini Querying"):
+            batch = all_classes[i : i + BATCH_SIZE]
+            
+            # 프롬프트 구성
+            batch_context = []
+            for cid, cname in batch:
+                existing_kwds = self.taxonomy.raw_keywords.get(cid, [])
+                existing_str = ", ".join(existing_kwds) if existing_kwds else "None"
+                batch_context.append(f"ID {cid} Name: '{cname}' (Existing: {existing_str})")
+            
+            classes_str = "\n".join(batch_context)
+            
+            prompt = (
+                f"I need to classify products. For each category below, provide:\n"
+                f"1. 'keywords': List of 5 NEW keywords (synonyms/slang).\n"
+                f"2. 'description': A one-sentence description.\n"
+                f"Output ONLY valid JSON: {{ID: {{'keywords': [], 'description': ''}}}}.\n\n"
+                f"{classes_str}"
+            )
+
+            try:
+                self.api_call_count += 1
+                response = model.generate_content(prompt)
+                
+                # JSON 파싱 (Gemini는 가끔 ```json ... ``` 으로 감싸서 줌)
+                text = response.text.replace("```json", "").replace("```", "").strip()
+                batch_result = json.loads(text)
+                
+                for str_cid, data in batch_result.items():
+                    generated_data[str(str_cid)] = data
+                
+                # [중요] 무료 티어 Rate Limit 방지 (4초 대기)
+                time.sleep(4) 
+                    
+            except Exception as e:
+                print(f"[Warning] Gemini call failed for batch {i}: {e}")
+                # 실패하면 Dummy 데이터로 채움 (멈추지 않음)
+                for cid, cname in batch:
+                    if str(cid) not in generated_data:
+                        generated_data[str(cid)] = {
+                            "keywords": [],
+                            "description": f"Product category for {cname}."
+                        }
 
         # 결과 저장
         with open(config.EXPANDED_KEYWORDS_PATH, 'w', encoding='utf-8') as f:

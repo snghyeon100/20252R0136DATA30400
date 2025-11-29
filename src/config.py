@@ -50,7 +50,7 @@ NLI_MODEL_NAME = "roberta-large-mnli"
 # 4. Training Hyperparameters (논문 Section 4 참조)
 # ==========================================
 BATCH_SIZE = 64
-NUM_EPOCHS = 5           # 전체 에폭 (Phase 1 + Phase 2 적절히 배분)
+NUM_EPOCHS = 15           # 전체 에폭 (Phase 1 + Phase 2 적절히 배분)
 
 # --- Phase 1: Initial Training Learning Rates ---
 LR_BERT_P1 = 5e-5        # BERT 파트 (조금만 수정)
