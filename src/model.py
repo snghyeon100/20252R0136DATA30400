@@ -58,9 +58,34 @@ class DualEncoder(nn.Module):
         super(DualEncoder, self).__init__()
         
         # 1. Document Encoder (BERT)
-        print(f"[Model] Loading Pretrained BERT: {config.BERT_MODEL_NAME}...")
+        print(f"[Model] Loading Pretrained SBERT: {config.BERT_MODEL_NAME}...")
         self.bert = AutoModel.from_pretrained(config.BERT_MODEL_NAME)
+        # -----------------------------------------------------------
+        # [핵심 수정] SOTA 전략: Layer-wise Freezing
+        # 하위 레이어는 "기초 영어" 담당이므로 얼리고(Freeze),
+        # 상위 레이어는 "리뷰 분석" 담당이므로 학습(Unfreeze)시킵니다.
+        # -----------------------------------------------------------
+        print("[Model] Applying Layer-wise Freezing (Freeze layers 0-7, Train 8-11)")
         
+        # 1단계: 일단 모든 파라미터를 얼립니다.
+        for param in self.bert.parameters():
+            param.requires_grad = False
+            
+        # 2단계: 상위 레이어(8, 9, 10, 11)와 Pooler만 다시 녹입니다.
+        for name, param in self.bert.named_parameters():
+            if 'encoder.layer' in name:
+                try:
+                    # 예: encoder.layer.11.output... -> 11 추출
+                    layer_num = int(name.split('encoder.layer.')[1].split('.')[0])
+                    if layer_num >= 8: # 8층 이상은 학습
+                        param.requires_grad = True
+                except:
+                    pass
+            
+            # 마지막 요약 층(Pooler)은 항상 학습
+            if 'pooler' in name:
+                param.requires_grad = True
+        # -----------------------------------------------------------
         # 2. Class Encoder (GNN)
         # BERT의 출력 차원(768)을 그대로 유지하며 그래프 연산 수행
         self.gnn = GraphEncoder(hidden_dim, hidden_dim)
@@ -95,9 +120,12 @@ class DualEncoder(nn.Module):
         """
         
         # --- A. Document Encoding (좌뇌) ---
-        # BERT를 통과시켜 [CLS] 토큰 벡터 추출
         outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-        doc_emb = outputs.last_hidden_state[:, 0, :] # (Batch, 768)
+        # 문장 전체의 평균을 사용 (SBERT가 좋아하는 방식)
+        # attention_mask를 이용해 패딩(0) 부분은 평균에서 제외
+        token_embeddings = outputs.last_hidden_state
+        input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+        doc_emb = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
         
         # --- B. Class Encoding (우뇌) ---
         # GNN을 통과시켜 구조적 정보가 담긴 클래스 벡터 생성
@@ -115,4 +143,4 @@ class DualEncoder(nn.Module):
         proj_feat = self.projection_head(doc_emb)
         proj_feat = F.normalize(proj_feat, p=2, dim=1)
         
-        return logits, proj_emb
+        return logits, proj_feat
