@@ -149,7 +149,7 @@ class Trainer:
             train_loss = self.train_epoch(epoch, mode)
             
             # 2. 검증 (Validation)
-            val_loss = self.evaluate(mode)
+            val_loss, val_f1 = self.evaluate(mode)
             
             print(f"Epoch {epoch}/{config.NUM_EPOCHS} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Mode: {mode}")
             
@@ -199,6 +199,8 @@ class Trainer:
             
         self.model.eval()
         total_loss = 0
+        all_preds = []
+        all_labels = []
         
         # 검증은 빠르게 진행 (tqdm 없이 하거나 간단히)
         for batch in self.val_loader:
@@ -214,8 +216,18 @@ class Trainer:
             loss = loss_cls + 0.1 * loss_con
                 
             total_loss += loss.item()
-            
-        return total_loss / len(self.val_loader)
+
+            preds = (torch.sigmoid(logits) > 0.5).float()
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
+        avg_loss = total_loss / len(self.val_loader)
+        all_preds = torch.cat(all_preds, dim=0).numpy()
+        all_labels = torch.cat(all_labels, dim=0).numpy()
+        
+        # Micro F1 (Kaggle Metric과 유사)
+        f1 = f1_score(all_labels, all_preds, average='micro')
+        
+        return avg_loss, f1
 
     # ... (나머지 _compute_taxonomy_aware_loss, _compute_contrastive_loss, _compute_target_q, predict 함수는 이전과 동일) ...
     # 코드 길이상 생략된 부분은 이전에 드린 코드의 함수들을 그대로 붙여넣으시면 됩니다.
