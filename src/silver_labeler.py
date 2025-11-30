@@ -192,8 +192,8 @@ class SilverLabeler:
         final_labels = {}
         
         RETRIEVAL_TOP_K = 50 # (속도 위해 25개로 조정)
-        RERANK_TOP_K = 10    # (속도 위해 10개로 조정)
-        MIN_SCORE_THRESHOLD = 0.2
+        RERANK_TOP_K = 20    # (속도 위해 10개로 조정)
+        MIN_SCORE_THRESHOLD = 0.01
         BATCH_SIZE = 128      # 배치 사이즈 설정 (메모리에 따라 조절)
 
         # 배치 단위로 처리
@@ -225,7 +225,7 @@ class SilverLabeler:
             # 쌍이 너무 많으면(32 * 25 = 800개) 여기서도 미니 배치로 나눠야 함
             # 안전하게 128개씩 끊어서 처리
             rerank_scores_list = []
-            MINI_BATCH = 2048
+            MINI_BATCH = 1024
             
             with torch.no_grad():
                 for j in range(0, len(all_pairs), MINI_BATCH):
@@ -248,41 +248,33 @@ class SilverLabeler:
             for i, doc_idx in enumerate(batch_indices):
                 scores_map = doc_candidate_scores[i]
                 
-                # 점수 높은 순 정렬 (Top-10)
+                # 점수 높은 순 정렬
                 sorted_candidates = sorted(scores_map.keys(), key=lambda x: scores_map[x], reverse=True)
-                final_candidates = sorted_candidates[:RERANK_TOP_K]
                 
-                # Filter
-                valid_candidates = []
-                for cid in final_candidates:
-                    if scores_map[cid] < MIN_SCORE_THRESHOLD: continue
-                    parents = self.taxonomy.get_parents(cid)
-                    is_connected = any(p in final_candidates for p in parents)
-                    is_root = (len(parents) == 0)
-                    if is_connected or is_root: valid_candidates.append(cid)
+                # [핵심 변경] 복잡한 필터 다 버리고, 무조건 상위 3개를 챙깁니다.
+                # 단, 점수가 너무 터무니없이 낮은(0.001 미만) 건 제외
+                best_candidates = []
+                for cid in sorted_candidates:
+                    if len(best_candidates) >= 3: break # 최대 3개
+                    if scores_map[cid] > 0.001:         # 최소한의 점수
+                        best_candidates.append(cid)
                 
-                if not valid_candidates:
-                    final_labels[pids[doc_idx]] = torch.zeros(config.NUM_CLASSES)
-                    continue
+                # 만약 2개도 안 모였으면, 점수 낮아도 그냥 상위 2개는 무조건 채웁니다. (강제 할당)
+                if len(best_candidates) < 2:
+                    best_candidates = sorted_candidates[:2]
 
-                # Confidence Check
-                core_classes = []
-                for c in valid_candidates:
-                    if self._check_local_confidence_reranked(c, scores_map):
-                        core_classes.append(c)
-
-                # Expansion
+                # Expansion (선택된 애들의 조상 노드도 정답으로 인정)
                 label_vec = torch.zeros(config.NUM_CLASSES)
-                if core_classes:
-                    label_vec[core_classes] = 1.0
-                    for core in core_classes:
+                if best_candidates:
+                    label_vec[best_candidates] = 1.0
+                    for core in best_candidates:
                         ancestors = self.taxonomy.get_ancestors(core)
                         label_vec[list(ancestors)] = 1.0
                 
                 final_labels[pids[doc_idx]] = label_vec
 
         self.silver_labels = final_labels
-        print(f"[SilverLabeler] Finished. Labels generated for {len(final_labels)} docs.")
+        print(f"[SilverLabeler] Finished. Force Top-2/3 Strategy applied.")
 
     def _check_local_confidence_reranked(self, class_id, scores_map):
         my_score = scores_map.get(class_id, 0.0)
@@ -295,4 +287,4 @@ class SilverLabeler:
         if not competitors: return True
         comp_scores = [scores_map.get(comp, 0.0) for comp in competitors]
         max_comp_score = max(comp_scores) if comp_scores else 0
-        return (my_score - max_comp_score) > 0.1
+        return (my_score - max_comp_score) > 0.03

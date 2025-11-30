@@ -216,7 +216,8 @@ class Trainer:
             
             # F1 Score 계산용 예측 (Threshold 0.5)
             preds = (torch.sigmoid(logits) > 0.5).float()
-            print(f"Preds Sum: {preds.sum().item()}")
+            avg_pred_count = preds.sum(dim=1).mean().item()
+            print(f"Avg Labels per Data: {avg_pred_count:.2f}")
             all_preds.append(preds.cpu())
             all_labels.append(labels.cpu())
             
@@ -267,7 +268,7 @@ class Trainer:
         return loss
 
     def _compute_target_q(self, p):
-        weight = p ** 2 / (p.sum(0)+ 1e-9)
+        weight = p ** 2 / (p ** 2 + (1 - p) ** 2 + 1e-9)
         return weight
     @torch.no_grad()
     def predict(self, loader):
