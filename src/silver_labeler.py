@@ -194,7 +194,7 @@ class SilverLabeler:
         RETRIEVAL_TOP_K = 25 # (속도 위해 25개로 조정)
         RERANK_TOP_K = 10    # (속도 위해 10개로 조정)
         MIN_SCORE_THRESHOLD = 0.01 
-        BATCH_SIZE = 32      # 배치 사이즈 설정 (메모리에 따라 조절)
+        BATCH_SIZE = 128      # 배치 사이즈 설정 (메모리에 따라 조절)
 
         # 배치 단위로 처리
         for start_idx in tqdm(range(0, num_docs, BATCH_SIZE), desc="Reranking"):
@@ -225,7 +225,7 @@ class SilverLabeler:
             # 쌍이 너무 많으면(32 * 25 = 800개) 여기서도 미니 배치로 나눠야 함
             # 안전하게 128개씩 끊어서 처리
             rerank_scores_list = []
-            MINI_BATCH = 128
+            MINI_BATCH = 2048
             
             with torch.no_grad():
                 for j in range(0, len(all_pairs), MINI_BATCH):
