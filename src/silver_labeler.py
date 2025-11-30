@@ -191,9 +191,9 @@ class SilverLabeler:
         review_texts = self.data_loader.data
         final_labels = {}
         
-        RETRIEVAL_TOP_K = 25 # (속도 위해 25개로 조정)
+        RETRIEVAL_TOP_K = 50 # (속도 위해 25개로 조정)
         RERANK_TOP_K = 10    # (속도 위해 10개로 조정)
-        MIN_SCORE_THRESHOLD = 0.01 
+        MIN_SCORE_THRESHOLD = 0.2
         BATCH_SIZE = 128      # 배치 사이즈 설정 (메모리에 따라 조절)
 
         # 배치 단위로 처리
@@ -295,4 +295,4 @@ class SilverLabeler:
         if not competitors: return True
         comp_scores = [scores_map.get(comp, 0.0) for comp in competitors]
         max_comp_score = max(comp_scores) if comp_scores else 0
-        return (my_score - max_comp_score) > 0.03
+        return (my_score - max_comp_score) > 0.1
