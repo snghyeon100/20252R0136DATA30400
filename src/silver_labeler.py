@@ -33,7 +33,8 @@ class SilverLabeler:
         
         # 2. Reranking용 BGE 모델
         print("[SilverLabeler] Loading Reranker (BGE: bge-reranker-v2-m3)...")
-        self.rerank_model_name = 'BAAI/bge-reranker-v2-m3'
+        #self.rerank_model_name = 'BAAI/bge-reranker-v2-m3'
+        self.rerank_model_name = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
         self.rerank_tokenizer = AutoTokenizer.from_pretrained(self.rerank_model_name)
         self.rerank_model = AutoModelForSequenceClassification.from_pretrained(self.rerank_model_name).to(device)
         self.rerank_model.eval()
@@ -182,7 +183,7 @@ class SilverLabeler:
         return torch.tensor(hybrid_sim, device=self.device)
 
     def _mine_core_classes_ultimate(self):
-        """[Reranking & Filtering]"""
+        """[Reranking & Filtering] (Batch Processing)"""
         print("[SilverLabeler] Step 2: Mining Core Classes (Rerank & Filter)...")
         
         num_docs = self.similarity_matrix.shape[0]
@@ -190,66 +191,95 @@ class SilverLabeler:
         review_texts = self.data_loader.data
         final_labels = {}
         
-        RETRIEVAL_TOP_K = 50 
-        RERANK_TOP_K = 15
+        RETRIEVAL_TOP_K = 25 # (속도 위해 25개로 조정)
+        RERANK_TOP_K = 10    # (속도 위해 10개로 조정)
         MIN_SCORE_THRESHOLD = 0.01 
-        
-        pbar = tqdm(range(num_docs), desc="Reranking")
-        for i in pbar:
-            # 1. Retrieval
-            doc_sims = self.similarity_matrix[i]
-            top_k_vals, top_k_inds = torch.topk(doc_sims, k=RETRIEVAL_TOP_K)
-            candidate_indices = top_k_inds.tolist()
+        BATCH_SIZE = 32      # 배치 사이즈 설정 (메모리에 따라 조절)
+
+        # 배치 단위로 처리
+        for start_idx in tqdm(range(0, num_docs, BATCH_SIZE), desc="Reranking"):
+            end_idx = min(start_idx + BATCH_SIZE, num_docs)
+            batch_indices = range(start_idx, end_idx)
             
-            # 2. Reranking (BGE)
-            pairs = []
-            current_review = review_texts[i]
-            for cid in candidate_indices:
-                # 여기서 self.class_texts_for_rerank가 비어있으면 에러남 -> 위에서 _prepare_class_texts로 해결
-                pairs.append([current_review, self.class_texts_for_rerank[cid]])
+            # --- 1. Retrieval (Hybrid) - 배치 ---
+            # (Batch, 531)
+            batch_doc_sims = self.similarity_matrix[start_idx:end_idx] 
+            
+            # (Batch, K)
+            batch_top_k_vals, batch_top_k_inds = torch.topk(batch_doc_sims, k=RETRIEVAL_TOP_K)
+            
+            # --- 2. Reranking (BGE) - 배치 ---
+            # Reranker 입력 쌍 만들기 (모든 배치의 후보들을 한 리스트에 담음)
+            all_pairs = []
+            pair_map = [] # (batch_relative_idx, candidate_idx) 매핑 정보
+            
+            for i, doc_idx in enumerate(batch_indices):
+                current_review = review_texts[doc_idx]
+                candidate_indices = batch_top_k_inds[i].tolist()
+                
+                for cid in candidate_indices:
+                    all_pairs.append([current_review, self.class_texts_for_rerank[cid]])
+                    pair_map.append((i, cid)) # i번째 문서의 cid 후보
+            
+            # BGE 모델 추론 (한방에 처리)
+            # 쌍이 너무 많으면(32 * 25 = 800개) 여기서도 미니 배치로 나눠야 함
+            # 안전하게 128개씩 끊어서 처리
+            rerank_scores_list = []
+            MINI_BATCH = 128
             
             with torch.no_grad():
-                inputs = self.rerank_tokenizer(pairs, padding=True, truncation=True, return_tensors='pt', max_length=256).to(self.device)
-                scores = self.rerank_model(**inputs, return_dict=True).logits.view(-1).float()
-                rerank_scores = torch.sigmoid(scores)
+                for j in range(0, len(all_pairs), MINI_BATCH):
+                    mini_pairs = all_pairs[j : j + MINI_BATCH]
+                    inputs = self.rerank_tokenizer(mini_pairs, padding=True, truncation=True, return_tensors='pt', max_length=256).to(self.device)
+                    scores = self.rerank_model(**inputs, return_dict=True).logits.view(-1).float()
+                    rerank_scores_list.append(torch.sigmoid(scores))
             
-            # Re-sort
-            rerank_vals, rerank_inds_local = torch.topk(rerank_scores, k=RERANK_TOP_K)
+            all_rerank_scores = torch.cat(rerank_scores_list) # (Batch * K, )
             
-            final_candidates = []
-            final_scores_map = {}
-            for val, local_idx in zip(rerank_vals, rerank_inds_local):
-                global_cid = candidate_indices[local_idx.item()]
-                final_candidates.append(global_cid)
-                final_scores_map[global_cid] = val.item()
+            # 점수 재배치 (각 문서별로 다시 묶기)
+            # 문서별 점수 저장소 초기화
+            doc_candidate_scores = [{} for _ in range(len(batch_indices))]
             
-            # 3. Filter & Confidence
-            valid_candidates = []
-            for cid in final_candidates:
-                if final_scores_map[cid] < MIN_SCORE_THRESHOLD: continue
-                parents = self.taxonomy.get_parents(cid)
-                is_connected = any(p in final_candidates for p in parents)
-                is_root = (len(parents) == 0)
-                if is_connected or is_root: valid_candidates.append(cid)
+            for k, score in enumerate(all_rerank_scores):
+                doc_rel_idx, cid = pair_map[k]
+                doc_candidate_scores[doc_rel_idx][cid] = score.item()
             
-            if not valid_candidates:
-                final_labels[pids[i]] = torch.zeros(config.NUM_CLASSES)
-                continue
+            # --- 3. Filter & Confidence & Expansion (문서별 처리) ---
+            for i, doc_idx in enumerate(batch_indices):
+                scores_map = doc_candidate_scores[i]
+                
+                # 점수 높은 순 정렬 (Top-10)
+                sorted_candidates = sorted(scores_map.keys(), key=lambda x: scores_map[x], reverse=True)
+                final_candidates = sorted_candidates[:RERANK_TOP_K]
+                
+                # Filter
+                valid_candidates = []
+                for cid in final_candidates:
+                    if scores_map[cid] < MIN_SCORE_THRESHOLD: continue
+                    parents = self.taxonomy.get_parents(cid)
+                    is_connected = any(p in final_candidates for p in parents)
+                    is_root = (len(parents) == 0)
+                    if is_connected or is_root: valid_candidates.append(cid)
+                
+                if not valid_candidates:
+                    final_labels[pids[doc_idx]] = torch.zeros(config.NUM_CLASSES)
+                    continue
 
-            core_classes = []
-            for c in valid_candidates:
-                if self._check_local_confidence_reranked(c, final_scores_map):
-                    core_classes.append(c)
+                # Confidence Check
+                core_classes = []
+                for c in valid_candidates:
+                    if self._check_local_confidence_reranked(c, scores_map):
+                        core_classes.append(c)
 
-            # 4. Expansion
-            label_vec = torch.zeros(config.NUM_CLASSES)
-            if core_classes:
-                label_vec[core_classes] = 1.0
-                for core in core_classes:
-                    ancestors = self.taxonomy.get_ancestors(core)
-                    label_vec[list(ancestors)] = 1.0
-            
-            final_labels[pids[i]] = label_vec
+                # Expansion
+                label_vec = torch.zeros(config.NUM_CLASSES)
+                if core_classes:
+                    label_vec[core_classes] = 1.0
+                    for core in core_classes:
+                        ancestors = self.taxonomy.get_ancestors(core)
+                        label_vec[list(ancestors)] = 1.0
+                
+                final_labels[pids[doc_idx]] = label_vec
 
         self.silver_labels = final_labels
         print(f"[SilverLabeler] Finished. Labels generated for {len(final_labels)} docs.")

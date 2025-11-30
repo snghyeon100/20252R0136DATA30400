@@ -30,7 +30,7 @@ class GraphEncoder(nn.Module):
             (Num_Classes, 768) - 족보 정보가 반영된 클래스 임베딩
         """
         # 1. 선형 변환 (Transformation): X * W
-        h = self.linear(feature_matrix)
+        h = self.linear_1(feature_matrix)
         
         # 2. 정보 전파 (Propagation): A * H
         # 이웃 노드(부모/자식)의 정보가 나에게 흘러들어옴

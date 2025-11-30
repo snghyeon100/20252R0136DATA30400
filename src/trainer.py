@@ -7,41 +7,46 @@ import numpy as np
 from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
+from sklearn.metrics import f1_score
 import time
 from . import config, utils
 
 class EarlyStopping:
     """조기 종료를 위한 헬퍼 클래스"""
-    def __init__(self, patience=3, delta=0, path=config.MODEL_SAVE_PATH):
+    def __init__(self, patience=3, delta=0, path=config.MODEL_SAVE_PATH, mode = 'max'):
         self.patience = patience
         self.delta = delta
         self.path = path
         self.counter = 0
         self.best_score = None
         self.early_stop = False
+        self.mode = mode
         self.val_loss_min = np.inf
 
-    def __call__(self, val_loss, model):
-        score = -val_loss
+    def __call__(self, score, model):
+        # Max 모드(F1)면 그대로, Min 모드(Loss)면 부호 반대
+        if self.mode == 'min':
+            improvement = (score < self.best_score - self.delta) if self.best_score is not None else True
+        else:
+            improvement = (score > self.best_score + self.delta) if self.best_score is not None else True
 
         if self.best_score is None:
             self.best_score = score
-            self.save_checkpoint(val_loss, model)
-        elif score < self.best_score + self.delta:
+            self.save_checkpoint(score, model)
+        elif improvement:
+            self.best_score = score
+            self.save_checkpoint(score, model)
+            self.counter = 0
+        else:
             self.counter += 1
             print(f'[EarlyStopping] Count: {self.counter} / {self.patience}')
             if self.counter >= self.patience:
                 self.early_stop = True
-        else:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model)
-            self.counter = 0
 
-    def save_checkpoint(self, val_loss, model):
-        '''Validation loss가 감소하면 모델을 저장한다.'''
-        print(f'[EarlyStopping] Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
+    def save_checkpoint(self, score, model):
+        print(f'[EarlyStopping] Score improved ({self.val_score_best:.6f} --> {score:.6f}). Saving model...')
         torch.save(model.state_dict(), self.path)
-        self.val_loss_min = val_loss
+        self.val_score_best = score
 
 class Trainer:
     """
