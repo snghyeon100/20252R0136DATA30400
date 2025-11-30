@@ -16,7 +16,8 @@ class GraphEncoder(nn.Module):
     def __init__(self, input_dim, hidden_dim):
         super(GraphEncoder, self).__init__()
         # GCN Layer: Feature Transformation (W)
-        self.linear = nn.Linear(input_dim, hidden_dim)
+        self.linear_1 = nn.Linear(input_dim, hidden_dim)
+        self.linear_2 = nn.Linear(hidden_dim, hidden_dim)
         self.activation = nn.ReLU()
         self.dropout = nn.Dropout(0.1)
         
@@ -39,6 +40,11 @@ class GraphEncoder(nn.Module):
         h = self.activation(h)
         h = self.dropout(h)
         
+
+        h = self.linear_2(h)
+        h = torch.matmul(adj_matrix, h)
+        h = self.activation(h)
+        h = self.dropout(h)
         # (옵션) Residual Connection: 원래 내 정보도 잊지 않도록 더해줌
         h = h + feature_matrix 
         
