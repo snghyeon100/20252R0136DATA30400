@@ -254,9 +254,13 @@ class SilverLabeler:
                 # [핵심 변경] 복잡한 필터 다 버리고, 무조건 상위 3개를 챙깁니다.
                 # 단, 점수가 너무 터무니없이 낮은(0.001 미만) 건 제외
                 best_candidates = []
+                TARGET_COUNT = 1
+                MIN_SCORE = 0.01
                 for cid in sorted_candidates:
-                    if len(best_candidates) >= 3: break # 최대 3개
-                    if scores_map[cid] > 0.001:         # 최소한의 점수
+                    if len(best_candidates) >= TARGET_COUNT: 
+                        break # 3개 차면 즉시 종료
+                        
+                    if scores_map[cid] > MIN_SCORE:         
                         best_candidates.append(cid)
                 
                 # 만약 2개도 안 모였으면, 점수 낮아도 그냥 상위 2개는 무조건 채웁니다. (강제 할당)

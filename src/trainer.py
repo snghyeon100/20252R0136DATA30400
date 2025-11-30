@@ -69,6 +69,7 @@ class Trainer:
         self.early_stopping = EarlyStopping(patience=5, path=config.MODEL_SAVE_PATH, mode='max')
         pos_weight = torch.ones([config.NUM_CLASSES]) * 20.0
         self.bce_loss = nn.BCEWithLogitsLoss(reduction='none',pos_weight=pos_weight.to(device))
+        self.bce_loss_clean = nn.BCEWithLogitsLoss(reduction='none')
 
     def _prepare_class_features(self):
         print("[Trainer] Preparing Class Features from LLM data...")
@@ -175,8 +176,8 @@ class Trainer:
                     probs = torch.sigmoid(logits)
                     target_q = self._compute_target_q(probs)
                 # BCE with Soft Labels
-                loss_self = self.bce_loss(logits, target_q).mean()
-                lambda_weight = 0.7
+                loss_self = self.bce_loss_clean(logits, target_q).mean()
+                lambda_weight = 0.3
                 loss = lambda_weight * loss_sup + (1 - lambda_weight) * loss_self
 
             self.optimizer.zero_grad()
