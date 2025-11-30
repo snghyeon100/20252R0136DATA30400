@@ -167,13 +167,16 @@ class Trainer:
                 loss_cls = self._compute_taxonomy_aware_loss(logits, silver_labels)
                 loss_con = self._compute_contrastive_loss(proj_feat, silver_labels)
                 loss = loss_cls + (0.1 * loss_con)
+                loss_sup = self._compute_taxonomy_aware_loss(logits, silver_labels)
             else: 
                 # Self-Training: 예측값(P)을 강화한 Q를 정답으로 사용
                 with torch.no_grad():
                     probs = torch.sigmoid(logits)
                     target_q = self._compute_target_q(probs)
                 # BCE with Soft Labels
-                loss = F.binary_cross_entropy_with_logits(logits, target_q)
+                loss_self = self.bce_loss(logits, target_q).mean()
+                lambda_weight = 0.3
+                loss = lambda_weight * loss_sup + (1 - lambda_weight) * loss_self
 
             self.optimizer.zero_grad()
             loss.backward()
