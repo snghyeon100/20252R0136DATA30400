@@ -1,7 +1,6 @@
 # --- Deep Learning Core ---
 # AutoGluon 호환성을 위해 2.5.x 버전 사용
 torch==2.5.1
-torchvision
 torchaudio
 
 # --- NLP & Model ---
