@@ -149,7 +149,7 @@ class Trainer:
                 self.use_llm_selective = False
             else:
                 # ⚠️ 키를 코드에 박지 말고 환경변수로만 사용 권장
-                api_key = os.getenv("GOOGLE_API_KEY", "AIzaSyBWMed6l3oIzM_SZycUVwz1SjUtO60xs7I").strip()
+                api_key = os.getenv("GOOGLE_API_KEY", "").strip()
                 if not api_key:
                     print("[LLM] GOOGLE_API_KEY not set -> LLM disabled.")
                     self.use_llm_selective = False
