@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 import numpy as np
 import re
-import time
 import datetime
+from dotenv import load_dotenv
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 from torch.optim import AdamW
@@ -60,7 +60,7 @@ class EarlyStopping:
         torch.save(model.state_dict(), self.path)
         self.val_score_best = score
 
-
+load_dotenv()
 class Trainer:
     """
     Supervised-only 모델 학습 및 평가 (Self-Training 제거)
@@ -68,12 +68,16 @@ class Trainer:
       - leaf topK -> best path -> sibling softmax prob로 leaf 포함/제외
       - 결과는 항상 root-parent 또는 root-parent-leaf (2개 or 3개)
 
-    [LLM Selective 변경]
-    - 기존: top-3 path 중 선택 + use_leaf 판단
-    - 변경: "best path의 root/parent"는 고정으로 주고,
-            "parent의 leaf children 중 1개 선택 or NONE"만 LLM이 결정
+    [LLM Selective 변경 v2]
+    - 기존(현재 코드): best path의 root/parent를 고정으로 주고,
+                       parent의 leaf children 중 1개 선택(or NONE)만 LLM이 결정
       => 출력: [{"pid":"...","leaf_choice":0..K}]
-         (0이면 leaf 미포함)
+
+    - 변경(이번 수정): best path + second path에서 나온 root/parent를 "2개 후보"로 LLM에 제공
+                       LLM이 (parent 후보 1/2 선택) + (해당 parent 아래 leaf 후보 선택 or NONE) 결정
+      => 출력: [{"pid":"...","parent_choice":1,"leaf_choice":0}]
+         - parent_choice: 1..M (M은 후보 개수, 보통 2)
+         - leaf_choice: 0(NONE) 또는 1..K (선택한 parent 후보의 leaf 후보 인덱스)
     """
 
     def __init__(self, model, taxonomy, train_loader, val_loader=None, device=config.DEVICE):
@@ -103,20 +107,19 @@ class Trainer:
         self._is_single_parent_graph = self._check_single_parent_graph()
         self._fixed_chain_cache = self._precompute_fixed_leaf_chains() if self._is_single_parent_graph else None
 
-        # path 선택 점수 가중치 (silver_label.py와 동일한 디폴트)
+        # path 선택 점수 가중치
         self.w_root = float(getattr(config, "PATH_W_ROOT", 0.4))
         self.w_parent = float(getattr(config, "PATH_W_PARENT", 0.7))
         self.w_leaf = float(getattr(config, "PATH_W_LEAF", 1.0))
 
-        # leaf 후보 top-k
+        # leaf 후보 top-k (path scoring용)
         self.top_k_leaf = int(getattr(config, "SBERT_LEAF_TOP_K", 30))
 
-        # leaf 포함 여부 결정: sibling softmax 확률 임계값
+        # leaf 포함 여부 결정
         self.tau_prob = float(getattr(config, "LEAF_PROB_THRESHOLD", 0.5))
         self.temperature = float(getattr(config, "LEAF_SOFTMAX_TEMPERATURE", 1.0))
         self.temperature = max(self.temperature, 1e-6)
 
-        # eval 디버그 프린트(너무 많이 찍히면 느려짐)
         self.eval_debug = bool(getattr(config, "EVAL_DEBUG", False))
 
         # =========================
@@ -125,12 +128,15 @@ class Trainer:
         self.use_llm_selective = bool(getattr(config, "USE_LLM_SELECTIVE", True))
 
         self.llm_max_calls = int(getattr(config, "LLM_MAX_CALLS", 1000))
-        self.llm_batch_size = int(getattr(config, "LLM_BATCH_SIZE", 5))
+        self.llm_batch_size = int(getattr(config, "LLM_BATCH_SIZE", 10))
         self.llm_model_name = getattr(config, "LLM_MODEL_NAME", "gemini-2.5-flash")
         self.llm_review_max_chars = int(getattr(config, "LLM_REVIEW_MAX_CHARS", 1200))
-        self.llm_timeout_fallback_auto = True  # LLM 실패 시 auto로 fallback
+        self.llm_timeout_fallback_auto = True
 
-        # 불확실도 결합 가중치(랭크 퍼센타일 기반)
+        # ✅ (추가) LLM에 줄 leaf 후보 개수 제한 (parent 아래 leaf가 많으면 프롬프트 폭발 방지)
+        self.llm_leaf_top_k = int(getattr(config, "LLM_LEAF_TOP_K", 12))
+
+        # 불확실도 결합 가중치
         self.uncert_w_margin = float(getattr(config, "UNCERT_W_MARGIN", 1.0))
         self.uncert_w_leafgap = float(getattr(config, "UNCERT_W_LEAFGAP", 1.0))
 
@@ -141,6 +147,7 @@ class Trainer:
 
         self._freeze_bert()
         self.leaf_prob_delta = float(getattr(config, "LEAF_PROB_DELTA", 0.20))
+
         # =========================
         # LLM Prompt Logging
         # =========================
@@ -160,7 +167,7 @@ class Trainer:
             self.llm_log_jsonl = None
 
         # =========================
-        # Gemini init (선택) - _gemini_model 하나로 통일
+        # Gemini init (선택)
         # =========================
         self._gemini_model = None
         if self.use_llm_selective:
@@ -168,7 +175,7 @@ class Trainer:
                 print("[LLM] google-generativeai not installed -> LLM disabled.")
                 self.use_llm_selective = False
             else:
-                # ✅ 환경변수만 사용 (없으면 비활성화)
+                # ✅ 환경변수만 사용 권장
                 api_key = os.getenv("GOOGLE_API_KEY", "").strip()
                 if not api_key:
                     print("[LLM] GOOGLE_API_KEY not set -> LLM disabled.")
@@ -178,7 +185,7 @@ class Trainer:
                     self._gemini_model = genai.GenerativeModel(self.llm_model_name)
 
     def _freeze_bert(self):
-        """BERT 파라미터를 전부 고정 + dropout까지 끄기 위해 eval 고정"""
+        """BERT 파라미터 전부 고정 + dropout까지 끄기 위해 eval 고정"""
         for p in self.model.bert.parameters():
             p.requires_grad = False
         self.model.bert.eval()
@@ -186,6 +193,7 @@ class Trainer:
         total = sum(p.numel() for p in self.model.parameters())
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"[Trainer] Freeze BERT: trainable params = {trainable:,} / total params = {total:,}")
+
     def _llm_log_write_jsonl(self, obj: Dict[str, Any]):
         if not self.llm_log_enabled or self.llm_log_jsonl is None:
             return
@@ -216,8 +224,7 @@ class Trainer:
         return {str(pid): str(txt) for pid, txt in zip(pids, data)}
 
     # ---------------------------
-    # 퍼센타일 랭크 (작을수록 애매 => -value로 넣어서 큰게 애매가 되게 만들기)
-    # 반환: [0,1] (큰 값일수록 "상위")
+    # 퍼센타일 랭크
     # ---------------------------
     def _percentile_rank(self, x: torch.Tensor) -> torch.Tensor:
         N = x.numel()
@@ -229,7 +236,35 @@ class Trainer:
         return ranks / float(N - 1)
 
     # ---------------------------
-    # (핵심) 한 샘플 분석: top3 후보 + margin + leaf_gap + auto_nodes
+    # parent 아래 leaf 후보 수집 (leaf가 없으면 children로 대체)
+    # ---------------------------
+    def _get_leaf_children_under_parent(self, parent_id: int) -> List[int]:
+        children = self.taxonomy.get_children(parent_id) or []
+        if not children:
+            return []
+        leafs = [c for c in children if len(self.taxonomy.get_children(c) or []) == 0]
+        return leafs if leafs else children
+
+    # ---------------------------
+    # ✅ (추가) parent 아래 leaf 후보를 doc_probs로 topK 랭킹
+    # ---------------------------
+    def _rank_leaf_children_by_prob(self, parent_id: int, doc_probs: torch.Tensor, max_k: int) -> List[int]:
+        leafs = self._get_leaf_children_under_parent(parent_id)
+        if not leafs:
+            return []
+
+        if max_k is None or max_k <= 0 or len(leafs) <= max_k:
+            return leafs
+
+        leaf_tensor = torch.tensor(leafs, device=doc_probs.device, dtype=torch.long)
+        scores = doc_probs.index_select(0, leaf_tensor)
+        k = min(max_k, scores.numel())
+        _, pos = torch.topk(scores, k=k)
+        return [leafs[i] for i in pos.tolist()]
+
+    # ---------------------------
+    # (핵심) 한 샘플 분석: topN 후보 + margin + leaf_gap + auto_nodes
+    # + ✅ best/second 기반 parent 후보 2개 생성(llm_parent_candidates)
     # ---------------------------
     def _analyze_one_sample(
         self,
@@ -238,7 +273,7 @@ class Trainer:
     ) -> Dict[str, Any]:
         leaf_scores = doc_probs.index_select(0, self.leaf_ids_tensor)
         k = min(self.top_k_leaf, leaf_scores.numel())
-        top_vals, top_pos = torch.topk(leaf_scores, k=k)
+        _, top_pos = torch.topk(leaf_scores, k=k)
         cand_leaf_ids = [self.leaf_ids[idx] for idx in top_pos.tolist()]
 
         scored: List[Tuple[float, List[int]]] = []
@@ -257,6 +292,7 @@ class Trainer:
                 "leaf_p": 1.0,
                 "leaf_gap": 1.0,
                 "auto_nodes": [],
+                "llm_parent_candidates": [],
             }
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -267,6 +303,41 @@ class Trainer:
         leaf_p, leaf_gap, auto_nodes = self._auto_nodes_and_leaf_stats(best_chain, doc_probs)
         top_paths = [chain for (_, chain) in scored[:top_n_paths]]
 
+        # ✅ LLM에 줄 parent 후보 2개 (best/second chain에서 root/parent 추출)
+        llm_parent_candidates: List[Dict[str, Any]] = []
+        seen = set()
+
+        for ch in top_paths[:2]:  # best, second만
+            if not ch:
+                continue
+
+            if len(ch) == 1:
+                root_id = int(ch[0])
+                root_children = self.taxonomy.get_children(root_id) or []
+                if not root_children:
+                    continue
+                child_scores = [(c, float(doc_probs[c].item())) for c in root_children]
+                child_scores.sort(key=lambda x: x[1], reverse=True)
+                parent_id = int(child_scores[0][0])
+            else:
+                root_id = int(ch[0])
+                parent_id = int(ch[-2])
+
+            key = (root_id, parent_id)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            leaf_ids = self._rank_leaf_children_by_prob(parent_id, doc_probs, self.llm_leaf_top_k)
+            if not leaf_ids:
+                continue
+
+            llm_parent_candidates.append({
+                "root_id": root_id,
+                "parent_id": parent_id,
+                "leaf_ids": leaf_ids,
+            })
+
         return {
             "top_paths": top_paths,
             "best_chain": best_chain,
@@ -276,6 +347,7 @@ class Trainer:
             "leaf_p": float(leaf_p),
             "leaf_gap": float(leaf_gap),
             "auto_nodes": auto_nodes,
+            "llm_parent_candidates": llm_parent_candidates,  # ✅ 추가
         }
 
     def _auto_nodes_and_leaf_stats(self, best_chain: List[int], doc_probs: torch.Tensor) -> Tuple[float, float, List[int]]:
@@ -318,84 +390,88 @@ class Trainer:
         return " > ".join([self.taxonomy.id2name[cid] for cid in chain])
 
     # ---------------------------
-    # ✅ (변경) parent의 leaf children 후보 수집
+    # ✅ (변경) LLM item 구성: parent 후보 1~2개 + 각 후보의 leaf 리스트
     # ---------------------------
-    def _get_leaf_children_under_parent(self, parent_id: int) -> List[int]:
-        children = self.taxonomy.get_children(parent_id) or []
-        if not children:
-            return []
-        leafs = [c for c in children if len(self.taxonomy.get_children(c) or []) == 0]
-        return leafs if leafs else children
-
-    # ---------------------------
-    # ✅ (변경) LLM item 구성: root/parent 고정 + leaf 후보들(이름만) + NONE
-    # ---------------------------
-    def _build_llm_prompt_items(self, pid: str, review: str, root_id: int, parent_id: int, leaf_ids: List[int]) -> Dict[str, Any]:
+    def _build_llm_prompt_items(self, pid: str, review: str, parent_candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
         review = (review or "")[: self.llm_review_max_chars]
 
-        leaf_names = []
-        for lid in leaf_ids:
-            leaf_names.append(str(self.taxonomy.id2name.get(lid, str(lid))))
+        candidates_out = []
+        for c in (parent_candidates or [])[:2]:
+            root_id = int(c["root_id"])
+            parent_id = int(c["parent_id"])
+            leaf_ids = [int(x) for x in (c.get("leaf_ids", []) or [])]
+            if not leaf_ids:
+                continue
 
-        item = {
+            leaf_names = [str(self.taxonomy.id2name.get(lid, str(lid))) for lid in leaf_ids]
+
+            candidates_out.append({
+                "root_id": root_id,
+                "parent_id": parent_id,
+                "root_name": str(self.taxonomy.id2name.get(root_id, str(root_id))),
+                "parent_name": str(self.taxonomy.id2name.get(parent_id, str(parent_id))),
+                "leaf_ids": leaf_ids,      # 내부 매핑용
+                "leaf_names": leaf_names,  # LLM 입력용
+            })
+
+        return {
             "pid": pid,
             "review": review,
-            "root_id": int(root_id),
-            "parent_id": int(parent_id),
-            "root_name": str(self.taxonomy.id2name.get(root_id, str(root_id))),
-            "parent_name": str(self.taxonomy.id2name.get(parent_id, str(parent_id))),
-            "leaf_ids": [int(x) for x in leaf_ids],     # 매핑용(LLM에는 id 안 줌)
-            "leaf_names": leaf_names,                  # LLM 입력용(이름만)
+            "candidates": candidates_out,
         }
-        return item
 
     # ---------------------------
-    # ✅ (변경) LLM prompt 구성 (배치): leaf_choice만 반환
+    # ✅ (변경) LLM prompt 구성 (배치): parent_choice + leaf_choice 반환
     # ---------------------------
     def _build_llm_prompt_from_batch(self, batch_payload: List[Dict[str, Any]]) -> str:
         lines = []
-        lines.append("You are a product taxonomy leaf selector.")
-        lines.append("Given a review and a fixed root/parent category, choose ONE leaf under the parent, or NONE.")
+        lines.append("You are a taxonomy classifier.")
+        lines.append("For each item, choose ONE parent candidate (1 or 2), then choose ONE leaf under that parent, or NONE.")
         lines.append("Return ONLY a JSON array. No extra text, no markdown.")
         lines.append("")
-        lines.append('Output format: [{"pid":"...","leaf_choice":0}]')
+        lines.append('Output format: [{"pid":"...","parent_choice":1,"leaf_choice":0}]')
         lines.append("")
         lines.append("Rules:")
-        lines.append("- leaf_choice is an integer.")
-        lines.append("- 0 means NONE (do NOT include a leaf).")
-        lines.append("- 1..K selects the corresponding leaf candidate.")
-        lines.append("- Do not output anything except the JSON array.")
+        lines.append("- parent_choice is an integer selecting the parent candidate (1..M). If only one candidate is provided, use 1.")
+        lines.append("- leaf_choice is an integer index for the chosen parent's leaf_candidates.")
+        lines.append("- leaf_choice=0 means NONE (do NOT include a leaf).")
+        lines.append("- leaf_choice=1..K selects the corresponding leaf candidate.")
+        lines.append("- Output ONLY the JSON array.")
         lines.append("")
         lines.append("Items:")
 
         for it in batch_payload:
             pid = it.get("pid", "")
             review = it.get("review", "") or ""
-            root_name = it.get("root_name", "")
-            parent_name = it.get("parent_name", "")
-            leaf_names = it.get("leaf_names", []) or []
+            cands = it.get("candidates", []) or []
 
             lines.append(f"pid: {pid}")
-            lines.append(f"root: {root_name}")
-            lines.append(f"parent: {parent_name}")
             lines.append("review:")
             lines.append(review)
-            lines.append("leaf_candidates:")
-            lines.append("0) NONE")
-            for j, nm in enumerate(leaf_names, start=1):
-                lines.append(f"{j}) {nm}")
+            lines.append("parent_candidates:")
+
+            for pi, c in enumerate(cands, start=1):
+                lines.append(f"{pi}) root: {c.get('root_name','')} | parent: {c.get('parent_name','')}")
+                lines.append("   leaf_candidates:")
+                lines.append("   0) NONE")
+                leaf_names = c.get("leaf_names", []) or []
+                for j, nm in enumerate(leaf_names, start=1):
+                    lines.append(f"   {j}) {nm}")
+
             lines.append("")
 
         return "\n".join(lines)
 
     # ---------------------------
-    # ✅ (변경) LLM 응답 파싱: leaf_choice
+    # ✅ (변경) LLM 응답 파싱: parent_choice + leaf_choice
     # ---------------------------
     def _parse_llm_output(self, raw_text: str) -> Optional[List[Dict[str, Any]]]:
         """
         기대 포맷:
-          [{"pid":"...","leaf_choice":0}, ...]
-        (호환) choice 키가 오면 leaf_choice로 간주
+          [{"pid":"...","parent_choice":1,"leaf_choice":0}, ...]
+        (호환)
+          - parent_choice 없으면 1로 간주
+          - choice 키가 오면 leaf_choice로 간주
         """
         if not raw_text:
             return None
@@ -419,8 +495,15 @@ class Trainer:
                 continue
             if "pid" not in x:
                 continue
+
+            if "parent_choice" not in x:
+                x["parent_choice"] = 1
+
             if ("leaf_choice" not in x) and ("choice" not in x):
                 continue
+            if "leaf_choice" not in x:
+                x["leaf_choice"] = x.get("choice")
+
             out.append(x)
 
         return out if out else None
@@ -434,13 +517,12 @@ class Trainer:
                 print("[LLM DEBUG] _gemini_model is None -> fallback to auto")
             return None
 
-        # ✅ 이번 호출 번호(파일명용)
         call_id = self.llm_calls_used + 1
 
         prompt = self._build_llm_prompt_from_batch(batch_payload)
         prompt_chars = len(prompt)
 
-        # --- (A) prompt 저장 ---
+        # (A) prompt 저장
         if self.llm_log_enabled:
             pids = [str(x.get("pid", "")) for x in batch_payload]
             self._llm_log_write_text(f"call_{call_id:06d}_prompt.txt", prompt)
@@ -458,7 +540,7 @@ class Trainer:
             print("[LLM DEBUG] pids:", [x.get("pid") for x in batch_payload])
             print("="*60)
 
-        # ✅ 실제 호출 시도할 때만 카운트 증가
+        # 실제 호출 시도할 때만 카운트 증가
         self.llm_calls_used += 1
 
         try:
@@ -468,7 +550,7 @@ class Trainer:
             )
             raw_text = getattr(resp, "text", "") or ""
 
-            # --- (B) response 저장 ---
+            # (B) response 저장
             if self.llm_log_enabled and self.llm_log_save_response:
                 self._llm_log_write_text(f"call_{call_id:06d}_response.txt", raw_text)
                 self._llm_log_write_jsonl({
@@ -481,7 +563,7 @@ class Trainer:
             if debug:
                 print(f"[LLM DEBUG] exception={e}")
 
-            # --- (C) 에러 로그 ---
+            # (C) 에러 로그
             if self.llm_log_enabled:
                 self._llm_log_write_jsonl({
                     "call_id": call_id,
@@ -504,7 +586,7 @@ class Trainer:
                 })
             return None
 
-        # --- (D) parsed 저장 ---
+        # (D) parsed 저장
         if self.llm_log_enabled and self.llm_log_save_parsed:
             self._llm_log_write_text(
                 f"call_{call_id:06d}_parsed.json",
@@ -524,7 +606,6 @@ class Trainer:
             print("="*60 + "\n")
 
         return out
-
 
     # ---------------------------
     # Class feature 준비
@@ -662,7 +743,7 @@ class Trainer:
         return avg_loss, f1
 
     # ---------------------------
-    # Path Decoding
+    # Path Decoding (eval용: 여긴 LLM 개입 없음)
     # ---------------------------
     def _decode_path(self, probs: torch.Tensor) -> torch.Tensor:
         B, C = probs.shape
@@ -673,7 +754,7 @@ class Trainer:
 
             leaf_scores = doc_probs.index_select(0, self.leaf_ids_tensor)
             k = min(self.top_k_leaf, leaf_scores.numel())
-            top_vals, top_pos = torch.topk(leaf_scores, k=k)
+            _, top_pos = torch.topk(leaf_scores, k=k)
             cand_leaf_ids = [self.leaf_ids[idx] for idx in top_pos.tolist()]
 
             best_chain = None
@@ -884,7 +965,7 @@ class Trainer:
         return loss
 
     # ---------------------------
-    # ✅ (변경) predict: 애매샘플만 LLM, leaf 선택(or NONE)
+    # ✅ predict: 애매샘플만 LLM, (parent 후보 선택 + leaf 선택(or NONE))
     # ---------------------------
     @torch.no_grad()
     def predict(self, loader):
@@ -899,11 +980,11 @@ class Trainer:
 
         pids_all: List[str] = []
         auto_nodes_all: List[List[int]] = []
-        best_chain_all: List[Optional[List[int]]] = []
         margins: List[float] = []
         leaf_gaps: List[float] = []
+        parent_cands_all: List[List[Dict[str, Any]]] = []  # ✅ 추가: 샘플별 (best/second 기반) parent 후보
 
-        # 1) 전체 샘플 best_chain + margin/leaf_gap 수집
+        # 1) 전체 샘플 auto_nodes + margin/leaf_gap + parent 후보 수집
         for batch in tqdm(loader, desc="Predicting(collect ambiguity)"):
             input_ids = batch["input_ids"].to(self.device)
             mask = batch["attention_mask"].to(self.device)
@@ -916,13 +997,15 @@ class Trainer:
             for i in range(B):
                 pid = pids[i]
                 doc_probs = probs[i]
-                info = self._analyze_one_sample(doc_probs, top_n_paths=3)
+
+                # top_n_paths=2면 best/second만 보게 됨(권장)
+                info = self._analyze_one_sample(doc_probs, top_n_paths=2)
 
                 pids_all.append(pid)
                 auto_nodes_all.append(info["auto_nodes"])
-                best_chain_all.append(info["best_chain"])
                 margins.append(info["margin"])
                 leaf_gaps.append(info["leaf_gap"])
+                parent_cands_all.append(info.get("llm_parent_candidates", []) or [])
 
         N = len(pids_all)
         if N == 0:
@@ -952,7 +1035,7 @@ class Trainer:
         # 4) 기본(auto) 예측을 최종 공간에 복사
         final_nodes_all = [nodes[:] for nodes in auto_nodes_all]
 
-        # 5) LLM 호출(선택된 샘플만): root/parent 고정 + leaf 선택(or NONE)
+        # 5) LLM 호출(선택된 샘플만): parent 후보 선택 + leaf 선택(or NONE)
         debug_printed = False
         if n_select > 0:
             llm_items: List[Tuple[int, Dict[str, Any]]] = []
@@ -961,32 +1044,19 @@ class Trainer:
                 pid = pids_all[idx]
                 review = pid2text.get(pid, "")
 
-                chain = best_chain_all[idx]
-                if not chain or len(chain) == 0:
+                cands = parent_cands_all[idx] or []
+                if len(cands) == 0:
                     continue
 
-                # root / parent 결정
-                if len(chain) == 1:
-                    root_id = int(chain[0])
-                    root_children = self.taxonomy.get_children(root_id) or []
-                    if not root_children:
-                        continue
-                    # parent는 root의 child 중 확률 가장 높은 걸로 (doc_probs가 여기 없음 -> best_chain이 root만인 케이스는 거의 없음)
-                    # 안전하게: 첫 child를 parent로 둔다
-                    parent_id = int(root_children[0])
-                else:
-                    root_id = int(chain[0])
-                    parent_id = int(chain[-2])
-
-                leaf_ids = self._get_leaf_children_under_parent(parent_id)
-                if not leaf_ids:
+                item = self._build_llm_prompt_items(pid, review, cands[:2])
+                # candidates가 비면 스킵
+                if not item.get("candidates"):
                     continue
 
-                item = self._build_llm_prompt_items(pid, review, root_id, parent_id, leaf_ids)
                 llm_items.append((idx, item))
 
             bs = max(self.llm_batch_size, 1)
-            for s in tqdm(range(0, len(llm_items), bs), desc="LLM selective batches(leaf pick)"):
+            for s in tqdm(range(0, len(llm_items), bs), desc="LLM selective batches(parent+leaf pick)"):
                 chunk = llm_items[s:s+bs]
                 batch_payload = [it for (_, it) in chunk]
                 self.llm_items_sent += len(batch_payload)
@@ -999,20 +1069,20 @@ class Trainer:
                 if out is None:
                     continue
 
-                # pid -> leaf_choice
-                pred_map: Dict[str, int] = {}
+                # pid -> (parent_choice, leaf_choice)
+                pred_map: Dict[str, Tuple[int, int]] = {}
                 for obj in out:
                     if not isinstance(obj, dict):
                         continue
                     pid = str(obj.get("pid", "")).strip()
-                    choice = obj.get("leaf_choice", obj.get("choice", None))
-                    if not pid or choice is None:
+                    if not pid:
                         continue
                     try:
-                        choice = int(choice)
+                        parent_choice = int(obj.get("parent_choice", 1))
+                        leaf_choice = int(obj.get("leaf_choice", 0))
                     except Exception:
                         continue
-                    pred_map[pid] = choice
+                    pred_map[pid] = (parent_choice, leaf_choice)
 
                 # 적용
                 for idx, item in chunk:
@@ -1020,10 +1090,22 @@ class Trainer:
                     if pid not in pred_map:
                         continue
 
-                    leaf_choice = pred_map[pid]
-                    root_id = int(item["root_id"])
-                    parent_id = int(item["parent_id"])
-                    leaf_ids = item.get("leaf_ids", []) or []
+                    parent_choice, leaf_choice = pred_map[pid]
+                    cands = item.get("candidates", []) or []
+                    if not cands:
+                        continue
+
+                    # parent_choice 범위 보정
+                    if parent_choice < 1:
+                        parent_choice = 1
+                    if parent_choice > len(cands):
+                        # 범위 밖이면 스킵(auto 유지)
+                        continue
+
+                    chosen = cands[parent_choice - 1]
+                    root_id = int(chosen["root_id"])
+                    parent_id = int(chosen["parent_id"])
+                    leaf_ids = chosen.get("leaf_ids", []) or []
 
                     base_nodes = [root_id, parent_id]
 
@@ -1037,8 +1119,7 @@ class Trainer:
                         final_nodes_all[idx] = base_nodes + [chosen_leaf_id]
                         self.llm_items_parsed += 1
                         continue
-
-                    # 범위 밖이면 무시 (auto 유지)
+                    # 범위 밖이면 auto 유지
 
         # 6) summary
         calls_budget = self.llm_max_calls
