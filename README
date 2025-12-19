@@ -1,14 +1,14 @@
-# HMTC-Refinement: Hierarchical Text Classification
+#  HMTC-Refinement: Hierarchical Text Classification
 **Taxonomy Enrichment and LLM-Enhanced Hierarchical Text Classification with Selective Refinement**
 
 ---
 
-## Overview
+##  Overview
 This project implements a weakly-supervised hierarchical text classification (HMTC) method. It combines the structural knowledge of taxonomies with the analytical power of **Google Gemini 1.5**. The system automatically generates silver labels and refines them using a budgeted LLM strategy to achieve high accuracy with minimal supervision.
 
 ---
 
-## system Architecture
+##  System Architecture
 
 > ### **Step 1: Silver Label Generation**
 > - **Hybrid Retrieval**: Combines **SBERT** (Semantic) and **BM25** (Lexical) for initial document-class matching.
@@ -31,7 +31,7 @@ This project implements a weakly-supervised hierarchical text classification (HM
 
 ---
 
-## Performance Results
+##  Performance Results
 The enforcement of taxonomy constraints and selective refinement yields significant gains.
 
 | Method Variant | Micro-F1 Score |
@@ -41,3 +41,4 @@ The enforcement of taxonomy constraints and selective refinement yields signific
 | **Selective LLM Refinement (Final)** | **0.60** |
 
 ---
+
