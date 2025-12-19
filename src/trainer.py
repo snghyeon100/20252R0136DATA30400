@@ -66,11 +66,12 @@ class Trainer:
       - leaf topK -> best path -> sibling softmax prob로 leaf 포함/제외
       - 결과는 항상 root-parent 또는 root-parent-leaf (2개 or 3개)
 
-    [Fix 포함]
-    - self._gemini_model 로만 통일 (self.gemini 사용 제거)
-    - _build_llm_prompt_from_batch가 option의 path_name 키를 인식하도록 수정
-    - llm_calls_used는 실제 호출 시도할 때만 증가
-    - LLM debug는 첫 배치만: prompt_chars + raw_response_head + parsed_first2
+    [LLM Selective 변경]
+    - 기존: top-3 path 중 선택 + use_leaf 판단
+    - 변경: "best path의 root/parent"는 고정으로 주고,
+            "parent의 leaf children 중 1개 선택 or NONE"만 LLM이 결정
+      => 출력: [{"pid":"...","leaf_choice":0..K}]
+         (0이면 leaf 미포함)
     """
 
     def __init__(self, model, taxonomy, train_loader, val_loader=None, device=config.DEVICE):
@@ -122,7 +123,7 @@ class Trainer:
         self.use_llm_selective = bool(getattr(config, "USE_LLM_SELECTIVE", True))
 
         self.llm_max_calls = int(getattr(config, "LLM_MAX_CALLS", 1000))
-        self.llm_batch_size = int(getattr(config, "LLM_BATCH_SIZE", 5))  # 애매 샘플만 처리하니 5~10 추천
+        self.llm_batch_size = int(getattr(config, "LLM_BATCH_SIZE", 5))
         self.llm_model_name = getattr(config, "LLM_MODEL_NAME", "gemini-2.5-flash")
         self.llm_review_max_chars = int(getattr(config, "LLM_REVIEW_MAX_CHARS", 1200))
         self.llm_timeout_fallback_auto = True  # LLM 실패 시 auto로 fallback
@@ -148,7 +149,7 @@ class Trainer:
                 print("[LLM] google-generativeai not installed -> LLM disabled.")
                 self.use_llm_selective = False
             else:
-                # ⚠️ 키를 코드에 박지 말고 환경변수로만 사용 권장
+                # ✅ 환경변수만 사용 (없으면 비활성화)
                 api_key = os.getenv("GOOGLE_API_KEY", "").strip()
                 if not api_key:
                     print("[LLM] GOOGLE_API_KEY not set -> LLM disabled.")
@@ -285,70 +286,84 @@ class Trainer:
         return " > ".join([self.taxonomy.id2name[cid] for cid in chain])
 
     # ---------------------------
-    # LLM item 구성
+    # ✅ (변경) parent의 leaf children 후보 수집
     # ---------------------------
-    def _build_llm_prompt_items(self, pid: str, review: str, top_paths: List[List[int]]) -> Dict[str, Any]:
-        opts = []
-        for j, ch in enumerate(top_paths, start=1):
-            opts.append({
-                "option": j,
-                "path_ids": ch,
-                "path_name": self._chain_to_str(ch),  # ✅ key: path_name
-            })
-        review = (review or "")[: self.llm_review_max_chars]
-        return {"pid": pid, "review": review, "options": opts}
+    def _get_leaf_children_under_parent(self, parent_id: int) -> List[int]:
+        children = self.taxonomy.get_children(parent_id) or []
+        if not children:
+            return []
+        leafs = [c for c in children if len(self.taxonomy.get_children(c) or []) == 0]
+        return leafs if leafs else children
 
     # ---------------------------
-    # LLM prompt 구성 (배치)
+    # ✅ (변경) LLM item 구성: root/parent 고정 + leaf 후보들(이름만) + NONE
+    # ---------------------------
+    def _build_llm_prompt_items(self, pid: str, review: str, root_id: int, parent_id: int, leaf_ids: List[int]) -> Dict[str, Any]:
+        review = (review or "")[: self.llm_review_max_chars]
+
+        leaf_names = []
+        for lid in leaf_ids:
+            leaf_names.append(str(self.taxonomy.id2name.get(lid, str(lid))))
+
+        item = {
+            "pid": pid,
+            "review": review,
+            "root_id": int(root_id),
+            "parent_id": int(parent_id),
+            "root_name": str(self.taxonomy.id2name.get(root_id, str(root_id))),
+            "parent_name": str(self.taxonomy.id2name.get(parent_id, str(parent_id))),
+            "leaf_ids": [int(x) for x in leaf_ids],     # 매핑용(LLM에는 id 안 줌)
+            "leaf_names": leaf_names,                  # LLM 입력용(이름만)
+        }
+        return item
+
+    # ---------------------------
+    # ✅ (변경) LLM prompt 구성 (배치): leaf_choice만 반환
     # ---------------------------
     def _build_llm_prompt_from_batch(self, batch_payload: List[Dict[str, Any]]) -> str:
         lines = []
-        lines.append("You are a taxonomy-path classifier.")
-        lines.append("For each item, choose the best option and decide whether to include the leaf.")
-        lines.append("Return ONLY a JSON array. No extra text.")
+        lines.append("You are a product taxonomy leaf selector.")
+        lines.append("Given a review and a fixed root/parent category, choose ONE leaf under the parent, or NONE.")
+        lines.append("Return ONLY a JSON array. No extra text, no markdown.")
         lines.append("")
-        lines.append('Output format: [{"pid":"...","choice":1,"use_leaf":true}]')
+        lines.append('Output format: [{"pid":"...","leaf_choice":0}]')
         lines.append("")
         lines.append("Rules:")
-        lines.append("- choice must be 1,2,or 3 (matching the option index)")
-        lines.append("- use_leaf=true => keep full path (3 labels if provided)")
-        lines.append("- use_leaf=false => use only first 2 labels")
+        lines.append("- leaf_choice is an integer.")
+        lines.append("- 0 means NONE (do NOT include a leaf).")
+        lines.append("- 1..K selects the corresponding leaf candidate.")
+        lines.append("- Do not output anything except the JSON array.")
         lines.append("")
         lines.append("Items:")
 
         for it in batch_payload:
             pid = it.get("pid", "")
             review = it.get("review", "") or ""
-            options = it.get("options", []) or []
+            root_name = it.get("root_name", "")
+            parent_name = it.get("parent_name", "")
+            leaf_names = it.get("leaf_names", []) or []
 
             lines.append(f"pid: {pid}")
+            lines.append(f"root: {root_name}")
+            lines.append(f"parent: {parent_name}")
             lines.append("review:")
             lines.append(review)
-
-            lines.append("candidates:")
-            for j, opt in enumerate(options, start=1):
-                # ✅ path_name 키를 인식하도록 수정
-                path_str = (
-                    opt.get("path_str")
-                    or opt.get("path_name")     # ✅ 핵심 fix
-                    or opt.get("path_names")
-                    or opt.get("chain_names")
-                )
-                if not path_str:
-                    path_ids = opt.get("path_ids", [])
-                    path_str = " > ".join(map(str, path_ids))
-                lines.append(f"{j}) {path_str}")
+            lines.append("leaf_candidates:")
+            lines.append("0) NONE")
+            for j, nm in enumerate(leaf_names, start=1):
+                lines.append(f"{j}) {nm}")
             lines.append("")
 
         return "\n".join(lines)
 
     # ---------------------------
-    # LLM 응답 파싱
+    # ✅ (변경) LLM 응답 파싱: leaf_choice
     # ---------------------------
     def _parse_llm_output(self, raw_text: str) -> Optional[List[Dict[str, Any]]]:
         """
         기대 포맷:
-          [{"pid":"...","choice":1,"use_leaf":true}, ...]
+          [{"pid":"...","leaf_choice":0}, ...]
+        (호환) choice 키가 오면 leaf_choice로 간주
         """
         if not raw_text:
             return None
@@ -370,7 +385,9 @@ class Trainer:
         for x in obj:
             if not isinstance(x, dict):
                 continue
-            if "pid" not in x or "choice" not in x or "use_leaf" not in x:
+            if "pid" not in x:
+                continue
+            if ("leaf_choice" not in x) and ("choice" not in x):
                 continue
             out.append(x)
 
@@ -411,7 +428,6 @@ class Trainer:
         except Exception as e:
             if debug:
                 print(f"[LLM DEBUG] exception={e}")
-            # (선택) 429면 바로 fallback. 여기서 sleep/retry 넣고 싶으면 추가 가능.
             return None
 
         out = self._parse_llm_output(raw_text)
@@ -789,7 +805,7 @@ class Trainer:
         return loss
 
     # ---------------------------
-    # (A안) predict: Top-N 애매샘플만 LLM
+    # ✅ (변경) predict: 애매샘플만 LLM, leaf 선택(or NONE)
     # ---------------------------
     @torch.no_grad()
     def predict(self, loader):
@@ -804,11 +820,11 @@ class Trainer:
 
         pids_all: List[str] = []
         auto_nodes_all: List[List[int]] = []
-        top_paths_all: List[List[List[int]]] = []
+        best_chain_all: List[Optional[List[int]]] = []
         margins: List[float] = []
         leaf_gaps: List[float] = []
 
-        # 1) 전체 샘플 top3 후보 + margin/leaf_gap 수집
+        # 1) 전체 샘플 best_chain + margin/leaf_gap 수집
         for batch in tqdm(loader, desc="Predicting(collect ambiguity)"):
             input_ids = batch["input_ids"].to(self.device)
             mask = batch["attention_mask"].to(self.device)
@@ -825,7 +841,7 @@ class Trainer:
 
                 pids_all.append(pid)
                 auto_nodes_all.append(info["auto_nodes"])
-                top_paths_all.append(info["top_paths"])
+                best_chain_all.append(info["best_chain"])
                 margins.append(info["margin"])
                 leaf_gaps.append(info["leaf_gap"])
 
@@ -857,21 +873,41 @@ class Trainer:
         # 4) 기본(auto) 예측을 최종 공간에 복사
         final_nodes_all = [nodes[:] for nodes in auto_nodes_all]
 
-        # 5) LLM 호출(선택된 샘플만)
+        # 5) LLM 호출(선택된 샘플만): root/parent 고정 + leaf 선택(or NONE)
         debug_printed = False
         if n_select > 0:
             llm_items: List[Tuple[int, Dict[str, Any]]] = []
+
             for idx in sel_idx:
                 pid = pids_all[idx]
                 review = pid2text.get(pid, "")
-                top_paths = top_paths_all[idx] or []
-                if not top_paths:
+
+                chain = best_chain_all[idx]
+                if not chain or len(chain) == 0:
                     continue
-                item = self._build_llm_prompt_items(pid, review, top_paths)
+
+                # root / parent 결정
+                if len(chain) == 1:
+                    root_id = int(chain[0])
+                    root_children = self.taxonomy.get_children(root_id) or []
+                    if not root_children:
+                        continue
+                    # parent는 root의 child 중 확률 가장 높은 걸로 (doc_probs가 여기 없음 -> best_chain이 root만인 케이스는 거의 없음)
+                    # 안전하게: 첫 child를 parent로 둔다
+                    parent_id = int(root_children[0])
+                else:
+                    root_id = int(chain[0])
+                    parent_id = int(chain[-2])
+
+                leaf_ids = self._get_leaf_children_under_parent(parent_id)
+                if not leaf_ids:
+                    continue
+
+                item = self._build_llm_prompt_items(pid, review, root_id, parent_id, leaf_ids)
                 llm_items.append((idx, item))
 
             bs = max(self.llm_batch_size, 1)
-            for s in tqdm(range(0, len(llm_items), bs), desc="LLM selective batches"):
+            for s in tqdm(range(0, len(llm_items), bs), desc="LLM selective batches(leaf pick)"):
                 chunk = llm_items[s:s+bs]
                 batch_payload = [it for (_, it) in chunk]
                 self.llm_items_sent += len(batch_payload)
@@ -884,41 +920,46 @@ class Trainer:
                 if out is None:
                     continue
 
-                pred_map = {}
+                # pid -> leaf_choice
+                pred_map: Dict[str, int] = {}
                 for obj in out:
                     if not isinstance(obj, dict):
                         continue
                     pid = str(obj.get("pid", "")).strip()
-                    choice = obj.get("choice", None)
-                    use_leaf = obj.get("use_leaf", False)
+                    choice = obj.get("leaf_choice", obj.get("choice", None))
                     if not pid or choice is None:
                         continue
                     try:
                         choice = int(choice)
                     except Exception:
                         continue
-                    pred_map[pid] = (choice, bool(use_leaf))
+                    pred_map[pid] = choice
 
+                # 적용
                 for idx, item in chunk:
                     pid = item["pid"]
                     if pid not in pred_map:
                         continue
-                    choice, use_leaf = pred_map[pid]
 
-                    opts = item.get("options", [])
-                    if choice < 1 or choice > len(opts):
+                    leaf_choice = pred_map[pid]
+                    root_id = int(item["root_id"])
+                    parent_id = int(item["parent_id"])
+                    leaf_ids = item.get("leaf_ids", []) or []
+
+                    base_nodes = [root_id, parent_id]
+
+                    if leaf_choice == 0:
+                        final_nodes_all[idx] = base_nodes
+                        self.llm_items_parsed += 1
                         continue
 
-                    chosen = opts[choice - 1]
-                    chain = chosen.get("path_ids", [])
-                    if not chain:
+                    if 1 <= leaf_choice <= len(leaf_ids):
+                        chosen_leaf_id = int(leaf_ids[leaf_choice - 1])
+                        final_nodes_all[idx] = base_nodes + [chosen_leaf_id]
+                        self.llm_items_parsed += 1
                         continue
 
-                    if (len(chain) >= 3) and (use_leaf is False):
-                        chain = chain[:2]
-
-                    final_nodes_all[idx] = list(map(int, chain))
-                    self.llm_items_parsed += 1
+                    # 범위 밖이면 무시 (auto 유지)
 
         # 6) summary
         calls_budget = self.llm_max_calls

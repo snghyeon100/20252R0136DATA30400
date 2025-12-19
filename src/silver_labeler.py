@@ -142,7 +142,7 @@ class SilverLabeler:
         # BM25 + Hybrid 설정
         # =========================
         self.use_bm25 = bool(getattr(config, "USE_BM25", True))
-        self.hybrid_alpha = float(getattr(config, "HYBRID_ALPHA", 0.7))  # SBERT weight
+        self.hybrid_alpha = float(getattr(config, "HYBRID_ALPHA", 0.6))  # SBERT weight
         self.hybrid_alpha = min(max(self.hybrid_alpha, 0.0), 1.0)
 
         self.bm25_k1 = float(getattr(config, "BM25_K1", 1.5))
