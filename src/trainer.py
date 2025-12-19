@@ -139,6 +139,23 @@ class Trainer:
 
         self._freeze_bert()
         self.leaf_prob_delta = float(getattr(config, "LEAF_PROB_DELTA", 0.20))
+        # =========================
+        # LLM Prompt Logging
+        # =========================
+        self.llm_log_enabled = bool(getattr(config, "LLM_LOG_ENABLED", True))
+        self.llm_log_save_response = bool(getattr(config, "LLM_LOG_SAVE_RESPONSE", True))
+        self.llm_log_save_parsed = bool(getattr(config, "LLM_LOG_SAVE_PARSED", True))
+
+        base_dir = getattr(config, "LLM_LOG_DIR", "logs/llm_prompts")
+        self.llm_log_run_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.llm_log_dir = Path(base_dir) / self.llm_log_run_id
+
+        if self.llm_log_enabled:
+            self.llm_log_dir.mkdir(parents=True, exist_ok=True)
+            self.llm_log_jsonl = self.llm_log_dir / "llm_calls.jsonl"
+            print(f"[LLM LOG] enabled. dir={self.llm_log_dir}")
+        else:
+            self.llm_log_jsonl = None
 
         # =========================
         # Gemini init (선택) - _gemini_model 하나로 통일
@@ -167,6 +184,19 @@ class Trainer:
         total = sum(p.numel() for p in self.model.parameters())
         trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"[Trainer] Freeze BERT: trainable params = {trainable:,} / total params = {total:,}")
+    def _llm_log_write_jsonl(self, obj: Dict[str, Any]):
+        if not self.llm_log_enabled or self.llm_log_jsonl is None:
+            return
+        obj = dict(obj)
+        obj["ts"] = datetime.datetime.now().isoformat()
+        with open(self.llm_log_jsonl, "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    def _llm_log_write_text(self, filename: str, text: str):
+        if not self.llm_log_enabled:
+            return
+        path = self.llm_log_dir / filename
+        path.write_text(text or "", encoding="utf-8")
 
     # ---------------------------
     # pid -> raw text 매핑 (dataset 수정 없이도 동작)
@@ -397,18 +427,28 @@ class Trainer:
     # LLM 호출 (배치 1콜)
     # ---------------------------
     def _llm_choose_batch(self, batch_payload, debug=False):
-        """
-        batch_payload: List[Dict]
-        return: parsed list[dict] or None
-        """
-        # ✅ 모델이 없으면 바로 fallback (calls_used도 올리지 않음)
         if self._gemini_model is None:
             if debug:
                 print("[LLM DEBUG] _gemini_model is None -> fallback to auto")
             return None
 
+        # ✅ 이번 호출 번호(파일명용)
+        call_id = self.llm_calls_used + 1
+
         prompt = self._build_llm_prompt_from_batch(batch_payload)
         prompt_chars = len(prompt)
+
+        # --- (A) prompt 저장 ---
+        if self.llm_log_enabled:
+            pids = [str(x.get("pid", "")) for x in batch_payload]
+            self._llm_log_write_text(f"call_{call_id:06d}_prompt.txt", prompt)
+            self._llm_log_write_jsonl({
+                "call_id": call_id,
+                "event": "prompt_saved",
+                "prompt_chars": prompt_chars,
+                "batch_size": len(batch_payload),
+                "pids": pids,
+            })
 
         if debug:
             print("\n" + "="*60)
@@ -425,9 +465,27 @@ class Trainer:
                 generation_config={"temperature": 0.0, "response_mime_type": "application/json"},
             )
             raw_text = getattr(resp, "text", "") or ""
+
+            # --- (B) response 저장 ---
+            if self.llm_log_enabled and self.llm_log_save_response:
+                self._llm_log_write_text(f"call_{call_id:06d}_response.txt", raw_text)
+                self._llm_log_write_jsonl({
+                    "call_id": call_id,
+                    "event": "response_saved",
+                    "response_chars": len(raw_text),
+                })
+
         except Exception as e:
             if debug:
                 print(f"[LLM DEBUG] exception={e}")
+
+            # --- (C) 에러 로그 ---
+            if self.llm_log_enabled:
+                self._llm_log_write_jsonl({
+                    "call_id": call_id,
+                    "event": "exception",
+                    "error": repr(e),
+                })
             return None
 
         out = self._parse_llm_output(raw_text)
@@ -436,7 +494,25 @@ class Trainer:
                 print("[LLM DEBUG] raw_response_head:")
                 print(raw_text[:800])
                 print("[LLM DEBUG] parse failed")
+
+            if self.llm_log_enabled:
+                self._llm_log_write_jsonl({
+                    "call_id": call_id,
+                    "event": "parse_failed",
+                })
             return None
+
+        # --- (D) parsed 저장 ---
+        if self.llm_log_enabled and self.llm_log_save_parsed:
+            self._llm_log_write_text(
+                f"call_{call_id:06d}_parsed.json",
+                json.dumps(out, ensure_ascii=False, indent=2)
+            )
+            self._llm_log_write_jsonl({
+                "call_id": call_id,
+                "event": "parse_ok",
+                "parsed_items": len(out),
+            })
 
         if debug:
             print("[LLM DEBUG] raw_response_head:")
@@ -446,6 +522,7 @@ class Trainer:
             print("="*60 + "\n")
 
         return out
+
 
     # ---------------------------
     # Class feature 준비
