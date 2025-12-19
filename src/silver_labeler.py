@@ -28,13 +28,9 @@ class SilverLabeler:
         self.taxonomy = taxonomy
         self.data_loader = data_loader
         self.device = device
-        self.expanded_kw = {}
 
-        expanded_path = getattr(config, "EXPANDED_KEYWORDS_PATH", "keywords_expanded.json")
-        if os.path.exists(expanded_path):
-            with open(expanded_path, "r", encoding="utf-8") as f:
-                self.expanded_kw = json.load(f)
-        print(f"[SilverLabeler] Expanded keywords loaded: {len(self.expanded_kw)} classes")
+        self.leaf_prob_delta = float(getattr(config, "LEAF_PROB_DELTA", 0.20))
+        
 
         # SBERT bi-encoder
         model_name = getattr(config, "SBERT_MODEL_NAME", "all-mpnet-base-v2")
@@ -91,58 +87,20 @@ class SilverLabeler:
     # SBERT Similarity
     # ------------------------------------------------------------------
     def _build_class_texts(self) -> List[str]:
-    """
-    클래스 텍스트 구성: class name + (raw keywords + expanded keywords) + description
-    - raw + expanded를 합치고 중복 제거(순서 보존)
-    - description은 있으면 붙임 (너무 길면 컷)
-    """
-        def merge_keywords(raw_list, exp_list):
-            merged = []
-            seen = set()
-            for w in (raw_list or []):
-                k = w.strip()
-                if not k:
-                    continue
-                key = k.lower()
-                if key not in seen:
-                    merged.append(k)
-                    seen.add(key)
-            for w in (exp_list or []):
-                k = w.strip()
-                if not k:
-                    continue
-                key = k.lower()
-                if key not in seen:
-                    merged.append(k)
-                    seen.add(key)
-            return merged
-
+        """
+        클래스 텍스트 구성: class name + raw keywords
+        """
         class_texts = []
         for cid in range(self.num_classes):
             cname = self.taxonomy.id2name[cid]
-
             raw_kwd = self.taxonomy.raw_keywords.get(cid, [])
-            info = self.expanded_kw.get(str(cid), {})
-            exp_kwd = info.get("keywords", [])
-            desc = (info.get("description", "") or "").strip()
-
-            keywords = merge_keywords(raw_kwd, exp_kwd)
-
-            # SBERT 입력 너무 길어지면 불리할 수 있어서 description만 적당히 컷
-            max_desc_len = int(getattr(config, "SBERT_CLASS_DESC_MAXLEN", 300))
-            if max_desc_len > 0 and len(desc) > max_desc_len:
-                desc = desc[:max_desc_len]
-
-            if keywords and desc:
-                text = f"{cname}: {', '.join(keywords)}. {desc}"
-            elif keywords:
-                text = f"{cname}: {', '.join(keywords)}"
+            if raw_kwd:
+                text = f"{cname}: {', '.join(raw_kwd)}"
             else:
                 text = cname
-
             class_texts.append(text)
-
         return class_texts
+        
 
     def _load_or_build_sbert_similarity(self) -> torch.Tensor:
         if os.path.exists(self.sbert_sim_path):
@@ -276,38 +234,42 @@ class SilverLabeler:
         parent_id: int,
         chosen_leaf_id: int,
         doc_sims: torch.Tensor,
-        tau_prob: float,
+        tau_prob: float,      # <- 기존 인자 유지해도 되지만, 이제 사용 안 함(호환용)
         temperature: float
     ) -> bool:
         """
-        parent 아래 sibling leaf들 점수에 softmax를 적용하고,
-        chosen_leaf의 softmax 확률이 tau_prob 이상이면 True.
+        uniform-baseline 정규화:
+          p(leaf | siblings) >= 1/n + delta  이면 leaf 포함
 
-        - sibling set = taxonomy.get_children(parent_id) 중 "leaf인 노드"만
-        - sibling leaf가 0/1개면(비교 대상이 없으면) leaf 포함을 기본(True)으로 둠
+        - sibling set = parent의 children 중 leaf만
+        - sibling leaf가 0/1개면 비교가 무의미하므로 True
         """
         children = self.taxonomy.get_children(parent_id) or []
         if not children:
-            return True  # parent 아래 뭐가 없으면 일단 포함(사실상 잘 안 나오는 케이스)
+            return True
 
-        # children 중 leaf만 필터
         sibling_leaf_ids = [c for c in children if len(self.taxonomy.get_children(c) or []) == 0]
 
-        # 혹시 chosen_leaf가 leaf가 아니라거나(드문 케이스) leaf 필터에서 빠지면 그냥 포함
         if chosen_leaf_id not in sibling_leaf_ids:
             return True
 
-        # sibling leaf가 1개면 softmax 확률은 1.0 -> leaf 포함
-        if len(sibling_leaf_ids) <= 1:
+        n = len(sibling_leaf_ids)
+        if n <= 1:
             return True
 
         sib_tensor = torch.tensor(sibling_leaf_ids, device=doc_sims.device, dtype=torch.long)
-        sib_scores = doc_sims.index_select(0, sib_tensor)  # (num_siblings,)
-        probs = torch.softmax(sib_scores / temperature, dim=0)  # (num_siblings,)
+        sib_scores = doc_sims.index_select(0, sib_tensor)  # (n,)
+        probs = torch.softmax(sib_scores / temperature, dim=0)
 
         idx = sibling_leaf_ids.index(chosen_leaf_id)
         p = float(probs[idx].item())
-        return p >= tau_prob
+
+        baseline = 1.0 / n
+        thr = baseline + float(getattr(config, "LEAF_PROB_DELTA", 0.20))
+        if thr > 0.999:
+            thr = 0.999
+
+        return p >= thr
 
     def _score_chain(
         self,

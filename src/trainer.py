@@ -1,13 +1,23 @@
+# src/trainer.py
 import os
 import json
 import torch
 import torch.nn as nn
 import numpy as np
+import re
+import time
+from typing import Dict, List, Tuple, Any, Optional
 from torch.optim import AdamW
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModel
 from sklearn.metrics import f1_score
 from . import config, utils
+
+try:
+    import google.generativeai as genai
+    _HAS_GEMINI = True
+except Exception:
+    _HAS_GEMINI = False
 
 
 class EarlyStopping:
@@ -55,7 +65,14 @@ class Trainer:
     + (중요) evaluate/predict 디코딩을 "path 디코딩"으로 변경
       - leaf topK -> best path -> sibling softmax prob로 leaf 포함/제외
       - 결과는 항상 root-parent 또는 root-parent-leaf (2개 or 3개)
+
+    [Fix 포함]
+    - self._gemini_model 로만 통일 (self.gemini 사용 제거)
+    - _build_llm_prompt_from_batch가 option의 path_name 키를 인식하도록 수정
+    - llm_calls_used는 실제 호출 시도할 때만 증가
+    - LLM debug는 첫 배치만: prompt_chars + raw_response_head + parsed_first2
     """
+
     def __init__(self, model, taxonomy, train_loader, val_loader=None, device=config.DEVICE):
         self.model = model.to(device)
         self.taxonomy = taxonomy
@@ -92,13 +109,331 @@ class Trainer:
         self.top_k_leaf = int(getattr(config, "SBERT_LEAF_TOP_K", 30))
 
         # leaf 포함 여부 결정: sibling softmax 확률 임계값
-        self.tau_prob = float(getattr(config, "LEAF_PROB_THRESHOLD", 0.62))
+        self.tau_prob = float(getattr(config, "LEAF_PROB_THRESHOLD", 0.5))
         self.temperature = float(getattr(config, "LEAF_SOFTMAX_TEMPERATURE", 1.0))
         self.temperature = max(self.temperature, 1e-6)
 
         # eval 디버그 프린트(너무 많이 찍히면 느려짐)
         self.eval_debug = bool(getattr(config, "EVAL_DEBUG", False))
 
+        # =========================
+        # LLM Selective Predict 설정
+        # =========================
+        self.use_llm_selective = bool(getattr(config, "USE_LLM_SELECTIVE", True))
+
+        self.llm_max_calls = int(getattr(config, "LLM_MAX_CALLS", 1000))
+        self.llm_batch_size = int(getattr(config, "LLM_BATCH_SIZE", 5))  # 애매 샘플만 처리하니 5~10 추천
+        self.llm_model_name = getattr(config, "LLM_MODEL_NAME", "gemini-2.5-flash")
+        self.llm_review_max_chars = int(getattr(config, "LLM_REVIEW_MAX_CHARS", 1200))
+        self.llm_timeout_fallback_auto = True  # LLM 실패 시 auto로 fallback
+
+        # 불확실도 결합 가중치(랭크 퍼센타일 기반)
+        self.uncert_w_margin = float(getattr(config, "UNCERT_W_MARGIN", 1.0))
+        self.uncert_w_leafgap = float(getattr(config, "UNCERT_W_LEAFGAP", 1.0))
+
+        # 카운터
+        self.llm_calls_used = 0
+        self.llm_items_sent = 0
+        self.llm_items_parsed = 0
+
+        self._freeze_bert()
+        self.leaf_prob_delta = float(getattr(config, "LEAF_PROB_DELTA", 0.20))
+
+        # =========================
+        # Gemini init (선택) - _gemini_model 하나로 통일
+        # =========================
+        self._gemini_model = None
+        if self.use_llm_selective:
+            if not _HAS_GEMINI:
+                print("[LLM] google-generativeai not installed -> LLM disabled.")
+                self.use_llm_selective = False
+            else:
+                # ⚠️ 키를 코드에 박지 말고 환경변수로만 사용 권장
+                api_key = os.getenv("GOOGLE_API_KEY", "AIzaSyBWMed6l3oIzM_SZycUVwz1SjUtO60xs7I").strip()
+                if not api_key:
+                    print("[LLM] GOOGLE_API_KEY not set -> LLM disabled.")
+                    self.use_llm_selective = False
+                else:
+                    genai.configure(api_key=api_key)
+                    self._gemini_model = genai.GenerativeModel(self.llm_model_name)
+
+    def _freeze_bert(self):
+        """BERT 파라미터를 전부 고정 + dropout까지 끄기 위해 eval 고정"""
+        for p in self.model.bert.parameters():
+            p.requires_grad = False
+        self.model.bert.eval()
+
+        total = sum(p.numel() for p in self.model.parameters())
+        trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+        print(f"[Trainer] Freeze BERT: trainable params = {trainable:,} / total params = {total:,}")
+
+    # ---------------------------
+    # pid -> raw text 매핑 (dataset 수정 없이도 동작)
+    # ---------------------------
+    def _build_pid2text_from_loader(self, loader) -> Dict[str, str]:
+        ds = getattr(loader, "dataset", None)
+        if ds is None:
+            return {}
+        pids = getattr(ds, "pids", None)
+        data = getattr(ds, "data", None)
+        if pids is None or data is None:
+            return {}
+        if len(pids) != len(data):
+            return {}
+        return {str(pid): str(txt) for pid, txt in zip(pids, data)}
+
+    # ---------------------------
+    # 퍼센타일 랭크 (작을수록 애매 => -value로 넣어서 큰게 애매가 되게 만들기)
+    # 반환: [0,1] (큰 값일수록 "상위")
+    # ---------------------------
+    def _percentile_rank(self, x: torch.Tensor) -> torch.Tensor:
+        N = x.numel()
+        if N <= 1:
+            return torch.zeros_like(x)
+        order = torch.argsort(x)  # 오름차순
+        ranks = torch.empty_like(order, dtype=torch.float)
+        ranks[order] = torch.arange(N, device=x.device, dtype=torch.float)
+        return ranks / float(N - 1)
+
+    # ---------------------------
+    # (핵심) 한 샘플 분석: top3 후보 + margin + leaf_gap + auto_nodes
+    # ---------------------------
+    def _analyze_one_sample(
+        self,
+        doc_probs: torch.Tensor,
+        top_n_paths: int = 3,
+    ) -> Dict[str, Any]:
+        leaf_scores = doc_probs.index_select(0, self.leaf_ids_tensor)
+        k = min(self.top_k_leaf, leaf_scores.numel())
+        top_vals, top_pos = torch.topk(leaf_scores, k=k)
+        cand_leaf_ids = [self.leaf_ids[idx] for idx in top_pos.tolist()]
+
+        scored: List[Tuple[float, List[int]]] = []
+        for leaf_id in cand_leaf_ids:
+            chain = self._get_chain_root_to_leaf(leaf_id, doc_probs)
+            score = self._score_chain(chain, doc_probs)
+            scored.append((score, chain))
+
+        if not scored:
+            return {
+                "top_paths": [],
+                "best_chain": None,
+                "best_score": -1e9,
+                "second_score": -1e9,
+                "margin": 0.0,
+                "leaf_p": 1.0,
+                "leaf_gap": 1.0,
+                "auto_nodes": [],
+            }
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_chain = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else (best_score - 999.0)
+        margin = float(best_score - second_score)
+
+        leaf_p, leaf_gap, auto_nodes = self._auto_nodes_and_leaf_stats(best_chain, doc_probs)
+        top_paths = [chain for (_, chain) in scored[:top_n_paths]]
+
+        return {
+            "top_paths": top_paths,
+            "best_chain": best_chain,
+            "best_score": float(best_score),
+            "second_score": float(second_score),
+            "margin": float(margin),
+            "leaf_p": float(leaf_p),
+            "leaf_gap": float(leaf_gap),
+            "auto_nodes": auto_nodes,
+        }
+
+    def _auto_nodes_and_leaf_stats(self, best_chain: List[int], doc_probs: torch.Tensor) -> Tuple[float, float, List[int]]:
+        if not best_chain:
+            return 1.0, 1.0, []
+
+        if len(best_chain) == 1:
+            root_id = best_chain[0]
+            children = self.taxonomy.get_children(root_id) or []
+            if children:
+                child_scores = [(c, float(doc_probs[c].item())) for c in children]
+                child_scores.sort(key=lambda x: x[1], reverse=True)
+                parent_id = child_scores[0][0]
+                return 1.0, 1.0, [root_id, parent_id]
+            return 1.0, 1.0, [root_id]
+
+        root_id = best_chain[0]
+        parent_id = best_chain[-2]
+        leaf_id = best_chain[-1]
+
+        children = self.taxonomy.get_children(parent_id) or []
+        sibling_leaf_ids = [c for c in children if len(self.taxonomy.get_children(c) or []) == 0]
+
+        p = 1.0
+        if (leaf_id in sibling_leaf_ids) and (len(sibling_leaf_ids) > 1):
+            sib_tensor = torch.tensor(sibling_leaf_ids, device=doc_probs.device, dtype=torch.long)
+            sib_scores = doc_probs.index_select(0, sib_tensor)
+            probs_sib = torch.softmax(sib_scores / self.temperature, dim=0)
+            idx = sibling_leaf_ids.index(leaf_id)
+            p = float(probs_sib[idx].item())
+
+        leaf_gap = abs(p - float(self.tau_prob))
+        include_leaf = (p >= float(self.tau_prob))
+
+        if include_leaf and (leaf_id != parent_id):
+            return p, leaf_gap, [root_id, parent_id, leaf_id]
+        return p, leaf_gap, [root_id, parent_id]
+
+    def _chain_to_str(self, chain: List[int]) -> str:
+        return " > ".join([self.taxonomy.id2name[cid] for cid in chain])
+
+    # ---------------------------
+    # LLM item 구성
+    # ---------------------------
+    def _build_llm_prompt_items(self, pid: str, review: str, top_paths: List[List[int]]) -> Dict[str, Any]:
+        opts = []
+        for j, ch in enumerate(top_paths, start=1):
+            opts.append({
+                "option": j,
+                "path_ids": ch,
+                "path_name": self._chain_to_str(ch),  # ✅ key: path_name
+            })
+        review = (review or "")[: self.llm_review_max_chars]
+        return {"pid": pid, "review": review, "options": opts}
+
+    # ---------------------------
+    # LLM prompt 구성 (배치)
+    # ---------------------------
+    def _build_llm_prompt_from_batch(self, batch_payload: List[Dict[str, Any]]) -> str:
+        lines = []
+        lines.append("You are a taxonomy-path classifier.")
+        lines.append("For each item, choose the best option and decide whether to include the leaf.")
+        lines.append("Return ONLY a JSON array. No extra text.")
+        lines.append("")
+        lines.append('Output format: [{"pid":"...","choice":1,"use_leaf":true}]')
+        lines.append("")
+        lines.append("Rules:")
+        lines.append("- choice must be 1,2,or 3 (matching the option index)")
+        lines.append("- use_leaf=true => keep full path (3 labels if provided)")
+        lines.append("- use_leaf=false => use only first 2 labels")
+        lines.append("")
+        lines.append("Items:")
+
+        for it in batch_payload:
+            pid = it.get("pid", "")
+            review = it.get("review", "") or ""
+            options = it.get("options", []) or []
+
+            lines.append(f"pid: {pid}")
+            lines.append("review:")
+            lines.append(review)
+
+            lines.append("candidates:")
+            for j, opt in enumerate(options, start=1):
+                # ✅ path_name 키를 인식하도록 수정
+                path_str = (
+                    opt.get("path_str")
+                    or opt.get("path_name")     # ✅ 핵심 fix
+                    or opt.get("path_names")
+                    or opt.get("chain_names")
+                )
+                if not path_str:
+                    path_ids = opt.get("path_ids", [])
+                    path_str = " > ".join(map(str, path_ids))
+                lines.append(f"{j}) {path_str}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    # ---------------------------
+    # LLM 응답 파싱
+    # ---------------------------
+    def _parse_llm_output(self, raw_text: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        기대 포맷:
+          [{"pid":"...","choice":1,"use_leaf":true}, ...]
+        """
+        if not raw_text:
+            return None
+
+        m = re.search(r"\[[\s\S]*\]", raw_text)
+        if not m:
+            return None
+
+        blob = m.group(0)
+        try:
+            obj = json.loads(blob)
+        except Exception:
+            return None
+
+        if not isinstance(obj, list):
+            return None
+
+        out = []
+        for x in obj:
+            if not isinstance(x, dict):
+                continue
+            if "pid" not in x or "choice" not in x or "use_leaf" not in x:
+                continue
+            out.append(x)
+
+        return out if out else None
+
+    # ---------------------------
+    # LLM 호출 (배치 1콜)
+    # ---------------------------
+    def _llm_choose_batch(self, batch_payload, debug=False):
+        """
+        batch_payload: List[Dict]
+        return: parsed list[dict] or None
+        """
+        # ✅ 모델이 없으면 바로 fallback (calls_used도 올리지 않음)
+        if self._gemini_model is None:
+            if debug:
+                print("[LLM DEBUG] _gemini_model is None -> fallback to auto")
+            return None
+
+        prompt = self._build_llm_prompt_from_batch(batch_payload)
+        prompt_chars = len(prompt)
+
+        if debug:
+            print("\n" + "="*60)
+            print(f"[LLM DEBUG] prompt_chars={prompt_chars} | batch_items={len(batch_payload)}")
+            print("[LLM DEBUG] pids:", [x.get("pid") for x in batch_payload])
+            print("="*60)
+
+        # ✅ 실제 호출 시도할 때만 카운트 증가
+        self.llm_calls_used += 1
+
+        try:
+            resp = self._gemini_model.generate_content(
+                prompt,
+                generation_config={"temperature": 0.0, "response_mime_type": "application/json"},
+            )
+            raw_text = getattr(resp, "text", "") or ""
+        except Exception as e:
+            if debug:
+                print(f"[LLM DEBUG] exception={e}")
+            # (선택) 429면 바로 fallback. 여기서 sleep/retry 넣고 싶으면 추가 가능.
+            return None
+
+        out = self._parse_llm_output(raw_text)
+        if out is None:
+            if debug:
+                print("[LLM DEBUG] raw_response_head:")
+                print(raw_text[:800])
+                print("[LLM DEBUG] parse failed")
+            return None
+
+        if debug:
+            print("[LLM DEBUG] raw_response_head:")
+            print(raw_text[:800])
+            print("[LLM DEBUG] parsed_first2:")
+            print(out[:2])
+            print("="*60 + "\n")
+
+        return out
+
+    # ---------------------------
+    # Class feature 준비
+    # ---------------------------
     def _prepare_class_features(self):
         print("[Trainer] Preparing Class Features from LLM data...")
         if os.path.exists(config.EXPANDED_KEYWORDS_PATH):
@@ -128,7 +463,10 @@ class Trainer:
             for i in range(0, len(texts), batch_size):
                 batch_texts = texts[i:i+batch_size]
                 encoded = tokenizer(
-                    batch_texts, padding=True, truncation=True, max_length=128,
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=128,
                     return_tensors="pt"
                 ).to(self.device)
                 out = encoder(**encoded)
@@ -136,19 +474,15 @@ class Trainer:
                 input_mask_expanded = encoded['attention_mask'].unsqueeze(-1).expand(token_embeddings.size()).float()
                 emb = torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
                 features.append(emb)
+
         return torch.cat(features, dim=0).detach()
 
     def _get_optimizer(self):
-        bert_params = list(map(id, self.model.bert.parameters()))
-        base_params = filter(lambda p: id(p) not in bert_params, self.model.parameters())
-
-        lr_bert = config.LR_BERT_P1
         lr_base = config.LR_BASE_P1
-
-        optimizer = AdamW([
-            {'params': self.model.bert.parameters(), 'lr': lr_bert},
-            {'params': base_params, 'lr': lr_base}
-        ], weight_decay=0.01)
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if len(trainable_params) == 0:
+            raise RuntimeError("No trainable parameters! (All parameters are frozen)")
+        optimizer = AdamW(trainable_params, lr=lr_base, weight_decay=0.01)
         return optimizer
 
     def train(self):
@@ -157,11 +491,12 @@ class Trainer:
 
         for epoch in range(1, config.NUM_EPOCHS + 1):
             train_loss = self.train_epoch(epoch)
-
             val_loss, val_f1 = self.evaluate()
 
-            print(f"Epoch {epoch}/{config.NUM_EPOCHS} | Train Loss: {train_loss:.4f} | "
-                  f"Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}")
+            print(
+                f"Epoch {epoch}/{config.NUM_EPOCHS} | Train Loss: {train_loss:.4f} | "
+                f"Val Loss: {val_loss:.4f} | Val F1: {val_f1:.4f}"
+            )
 
             self.early_stopping(val_f1, self.model)
             if self.early_stopping.early_stop:
@@ -195,13 +530,6 @@ class Trainer:
 
     @torch.no_grad()
     def evaluate(self):
-        """
-        검증 데이터셋 평가 (Micro F1 Score 반환)
-
-        (중요 변경)
-        - 기존: sigmoid>0.5 + min2/max3 topk
-        - 변경: "path 디코딩"으로 2~3개 라벨을 항상 한 path로 만들고 F1 계산
-        """
         if self.val_loader is None:
             return 0.0, 0.0
 
@@ -217,13 +545,10 @@ class Trainer:
 
             logits, proj_feat = self.model(input_ids, mask, self.class_features, self.adj_matrix)
 
-            # loss
             loss = self._compute_taxonomy_aware_loss(logits, labels)
             total_loss += loss.item()
 
             probs = torch.sigmoid(logits)
-
-            # (핵심) path 디코딩으로 preds 생성 (multi-hot)
             preds = self._decode_path(probs)
 
             if self.eval_debug and bidx == 0:
@@ -236,54 +561,40 @@ class Trainer:
             all_labels.append(labels.cpu())
 
         avg_loss = total_loss / len(self.val_loader)
-
         all_preds = torch.cat(all_preds, dim=0).numpy()
         all_labels = torch.cat(all_labels, dim=0).numpy()
-
         f1 = f1_score(all_labels, all_preds, average='micro')
         return avg_loss, f1
 
     # ---------------------------
-    # (NEW) Path Decoding
+    # Path Decoding
     # ---------------------------
     def _decode_path(self, probs: torch.Tensor) -> torch.Tensor:
-        """
-        probs: (B, C)
-        return: multi-hot (B, C) where each row has 2 or 3 labels, and single-path constraint
-        """
         B, C = probs.shape
         preds = torch.zeros_like(probs)
 
         for i in range(B):
-            doc_probs = probs[i]  # (C,)
+            doc_probs = probs[i]
 
-            # 1) leaf top-K 후보
-            leaf_scores = doc_probs.index_select(0, self.leaf_ids_tensor)  # (num_leaf,)
+            leaf_scores = doc_probs.index_select(0, self.leaf_ids_tensor)
             k = min(self.top_k_leaf, leaf_scores.numel())
             top_vals, top_pos = torch.topk(leaf_scores, k=k)
-
             cand_leaf_ids = [self.leaf_ids[idx] for idx in top_pos.tolist()]
 
-            # 2) 후보 leaf들 중 best path 1개 선택
             best_chain = None
             best_chain_score = -1e9
-            best_leaf_id = None
 
             for leaf_id in cand_leaf_ids:
-                chain = self._get_chain_root_to_leaf(leaf_id, doc_probs)  # [root,...,leaf]
+                chain = self._get_chain_root_to_leaf(leaf_id, doc_probs)
                 chain_score = self._score_chain(chain, doc_probs)
-
                 if chain_score > best_chain_score:
                     best_chain_score = chain_score
                     best_chain = chain
-                    best_leaf_id = leaf_id
 
             if not best_chain:
                 continue
 
-            # 3) root/parent/leaf 결정
             if len(best_chain) == 1:
-                # root만 있는 이상 케이스: 자식 중 하나 붙여 2개 맞추기
                 root_id = best_chain[0]
                 children = self.taxonomy.get_children(root_id) or []
                 if children:
@@ -300,7 +611,6 @@ class Trainer:
             parent_id = best_chain[-2]
             leaf_id = best_chain[-1]
 
-            # 4) sibling softmax prob로 leaf 포함 여부 결정
             include_leaf = self._include_leaf_by_softmax_prob(
                 parent_id=parent_id,
                 chosen_leaf_id=leaf_id,
@@ -315,23 +625,16 @@ class Trainer:
         return preds
 
     def _include_leaf_by_softmax_prob(self, parent_id: int, chosen_leaf_id: int, doc_probs: torch.Tensor) -> bool:
-        """
-        parent 아래 sibling leaf들 점수에 softmax를 적용하고,
-        chosen_leaf의 softmax 확률이 tau_prob 이상이면 leaf 포함.
-
-        - sibling set = taxonomy.get_children(parent_id) 중 leaf만
-        - sibling leaf가 0/1개면 비교가 무의미하므로 leaf 포함(True)
-        """
         children = self.taxonomy.get_children(parent_id) or []
         if not children:
             return True
 
         sibling_leaf_ids = [c for c in children if len(self.taxonomy.get_children(c) or []) == 0]
-
         if chosen_leaf_id not in sibling_leaf_ids:
             return True
 
-        if len(sibling_leaf_ids) <= 1:
+        n = len(sibling_leaf_ids)
+        if n <= 1:
             return True
 
         sib_tensor = torch.tensor(sibling_leaf_ids, device=doc_probs.device, dtype=torch.long)
@@ -340,7 +643,13 @@ class Trainer:
 
         idx = sibling_leaf_ids.index(chosen_leaf_id)
         p = float(probs_sib[idx].item())
-        return p >= self.tau_prob
+
+        baseline = 1.0 / n
+        thr = baseline + self.leaf_prob_delta
+        if thr > 0.999:
+            thr = 0.999
+
+        return p >= thr
 
     def _score_chain(self, chain, doc_probs: torch.Tensor) -> float:
         if not chain:
@@ -358,11 +667,6 @@ class Trainer:
         return float(score.item())
 
     def _get_chain_root_to_leaf(self, leaf_id: int, doc_probs: torch.Tensor):
-        """
-        leaf_id의 경로를 [root,...,leaf]로 반환
-        - 단일부모 트리면 캐시 사용
-        - 다중부모(DAG)면 doc_probs 기준으로 가장 큰 부모를 선택해 경로 1개로 만듦
-        """
         if self._fixed_chain_cache is not None and leaf_id in self._fixed_chain_cache:
             return self._fixed_chain_cache[leaf_id]
 
@@ -435,26 +739,28 @@ class Trainer:
         return cache
 
     # ---------------------------
-    # Loss (unchanged)
+    # Loss
     # ---------------------------
     def _compute_taxonomy_aware_loss(self, logits, silver_labels):
         bce_loss = self.bce_loss(logits, silver_labels)
         mask = torch.ones_like(silver_labels, device=self.device)
 
         for i in range(silver_labels.shape[0]):
-            core_classes = torch.where(silver_labels[i] == 1)[0].tolist()
-            for c in core_classes:
-                children = self.taxonomy.get_children(c)
-                if children:
-                    children_tensor = torch.tensor(children, device=self.device)
-                    mask[i].index_fill_(0, children_tensor, 0.0)
+            positives = torch.where(silver_labels[i] == 1)[0].tolist()
+            for c in positives:
+                children = self.taxonomy.get_children(c) or []
+                if not children:
+                    continue
+
+                children_tensor = torch.tensor(children, device=self.device)
+                child_is_positive = silver_labels[i].index_select(0, children_tensor)
+                to_mask = children_tensor[child_is_positive == 0]
+
+                if to_mask.numel() > 0:
+                    mask[i].index_fill_(0, to_mask, 0.0)
 
         masked_loss_sum = (bce_loss * mask).sum()
-        valid_elements_count = mask.sum()
-
-        if valid_elements_count.item() == 0:
-            return torch.tensor(0.0, device=self.device)
-
+        valid_elements_count = mask.sum().clamp_min(1.0)
         return masked_loss_sum / valid_elements_count
 
     def _compute_contrastive_loss(self, features, labels, temperature=0.07):
@@ -483,37 +789,156 @@ class Trainer:
         return loss
 
     # ---------------------------
-    # Predict (중요 변경)
+    # (A안) predict: Top-N 애매샘플만 LLM
     # ---------------------------
     @torch.no_grad()
     def predict(self, loader):
-        """
-        (중요 변경)
-        - 기존: 각 샘플에서 probs top3를 threshold로 min2/max3
-        - 변경: evaluate와 동일한 path 디코딩으로 2~3개를 뽑음
-          => submission의 path invalid가 거의 0%로 떨어져야 정상
-        """
         self.model.eval()
-        all_preds = []
-        all_pids = []
 
-        for batch in tqdm(loader, desc="Predicting"):
-            input_ids = batch['input_ids'].to(self.device)
-            mask = batch['attention_mask'].to(self.device)
-            pids = batch['pid']
+        # reset counters
+        self.llm_calls_used = 0
+        self.llm_items_sent = 0
+        self.llm_items_parsed = 0
+
+        pid2text = self._build_pid2text_from_loader(loader)
+
+        pids_all: List[str] = []
+        auto_nodes_all: List[List[int]] = []
+        top_paths_all: List[List[List[int]]] = []
+        margins: List[float] = []
+        leaf_gaps: List[float] = []
+
+        # 1) 전체 샘플 top3 후보 + margin/leaf_gap 수집
+        for batch in tqdm(loader, desc="Predicting(collect ambiguity)"):
+            input_ids = batch["input_ids"].to(self.device)
+            mask = batch["attention_mask"].to(self.device)
+            pids = [str(x) for x in batch["pid"]]
 
             logits, _ = self.model(input_ids, mask, self.class_features, self.adj_matrix)
             probs = torch.sigmoid(logits)
 
-            # path 디코딩 -> multi-hot
-            mh = self._decode_path(probs)  # (B,C) 0/1
+            B = probs.size(0)
+            for i in range(B):
+                pid = pids[i]
+                doc_probs = probs[i]
+                info = self._analyze_one_sample(doc_probs, top_n_paths=3)
 
-            # 제출 형식용: 각 row의 label id list
-            for i in range(mh.size(0)):
-                idx = torch.where(mh[i] > 0.5)[0].tolist()
-                idx = sorted(map(int, idx))
-                all_preds.append(idx)
+                pids_all.append(pid)
+                auto_nodes_all.append(info["auto_nodes"])
+                top_paths_all.append(info["top_paths"])
+                margins.append(info["margin"])
+                leaf_gaps.append(info["leaf_gap"])
 
-            all_pids.extend(pids)
+        N = len(pids_all)
+        if N == 0:
+            return [], []
+
+        # 2) 불확실도 계산(퍼센타일 랭크)
+        device = self.device if torch.cuda.is_available() else "cpu"
+        m_t = torch.tensor(margins, dtype=torch.float, device=device)
+        g_t = torch.tensor(leaf_gaps, dtype=torch.float, device=device)
+
+        u_margin = self._percentile_rank(-m_t)
+        u_leaf = self._percentile_rank(-g_t)
+        uncert = self.uncert_w_margin * u_margin + self.uncert_w_leafgap * u_leaf
+
+        # 3) 예산에 맞는 top-N 애매 샘플 선택
+        budget_items = self.llm_max_calls * max(self.llm_batch_size, 1)
+        n_select = min(int(budget_items), N)
+        if not self.use_llm_selective:
+            n_select = 0
+
+        if n_select > 0:
+            _, sel_idx = torch.topk(uncert, k=n_select, largest=True)
+            sel_idx = sel_idx.tolist()
+        else:
+            sel_idx = []
+
+        # 4) 기본(auto) 예측을 최종 공간에 복사
+        final_nodes_all = [nodes[:] for nodes in auto_nodes_all]
+
+        # 5) LLM 호출(선택된 샘플만)
+        debug_printed = False
+        if n_select > 0:
+            llm_items: List[Tuple[int, Dict[str, Any]]] = []
+            for idx in sel_idx:
+                pid = pids_all[idx]
+                review = pid2text.get(pid, "")
+                top_paths = top_paths_all[idx] or []
+                if not top_paths:
+                    continue
+                item = self._build_llm_prompt_items(pid, review, top_paths)
+                llm_items.append((idx, item))
+
+            bs = max(self.llm_batch_size, 1)
+            for s in tqdm(range(0, len(llm_items), bs), desc="LLM selective batches"):
+                chunk = llm_items[s:s+bs]
+                batch_payload = [it for (_, it) in chunk]
+                self.llm_items_sent += len(batch_payload)
+
+                debug = (not debug_printed)  # 첫 배치만
+                out = self._llm_choose_batch(batch_payload, debug=debug)
+                if debug:
+                    debug_printed = True
+
+                if out is None:
+                    continue
+
+                pred_map = {}
+                for obj in out:
+                    if not isinstance(obj, dict):
+                        continue
+                    pid = str(obj.get("pid", "")).strip()
+                    choice = obj.get("choice", None)
+                    use_leaf = obj.get("use_leaf", False)
+                    if not pid or choice is None:
+                        continue
+                    try:
+                        choice = int(choice)
+                    except Exception:
+                        continue
+                    pred_map[pid] = (choice, bool(use_leaf))
+
+                for idx, item in chunk:
+                    pid = item["pid"]
+                    if pid not in pred_map:
+                        continue
+                    choice, use_leaf = pred_map[pid]
+
+                    opts = item.get("options", [])
+                    if choice < 1 or choice > len(opts):
+                        continue
+
+                    chosen = opts[choice - 1]
+                    chain = chosen.get("path_ids", [])
+                    if not chain:
+                        continue
+
+                    if (len(chain) >= 3) and (use_leaf is False):
+                        chain = chain[:2]
+
+                    final_nodes_all[idx] = list(map(int, chain))
+                    self.llm_items_parsed += 1
+
+        # 6) summary
+        calls_budget = self.llm_max_calls
+        print("\n==============================")
+        print("[LLM Selective Predict Summary]")
+        print(f"total_samples={N}")
+        print(f"use_llm_selective={self.use_llm_selective}")
+        print(f"llm_batch_size={self.llm_batch_size}")
+        print(f"budget_calls={calls_budget}  => budget_items={calls_budget * max(self.llm_batch_size,1)}")
+        print(f"selected_items={n_select} ({(n_select/N)*100:.2f}%)")
+        print(f"calls_used={self.llm_calls_used}")
+        print(f"items_sent={self.llm_items_sent}")
+        print(f"items_parsed={self.llm_items_parsed}")
+        print("==============================\n")
+
+        # 7) 제출 형식: (pids, list_of_label_ids)
+        all_pids = pids_all
+        all_preds = []
+        for nodes in final_nodes_all:
+            uniq = sorted(set(map(int, nodes)))
+            all_preds.append(uniq)
 
         return all_pids, all_preds

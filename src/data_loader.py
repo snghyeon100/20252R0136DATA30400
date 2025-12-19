@@ -145,7 +145,8 @@ class ReviewDataset(Dataset):
         item = {
             "input_ids": encoding["input_ids"].flatten(),
             "attention_mask": encoding["attention_mask"].flatten(),
-            "pid": pid
+            "pid": pid,
+            "text": text
         }
 
         # 학습 시 Silver Label이 있으면 같이 반환
