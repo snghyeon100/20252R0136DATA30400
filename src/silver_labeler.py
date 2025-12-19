@@ -1,7 +1,10 @@
 # silver_label.py
 import os
-from typing import Dict, List, Optional
-import json
+import re
+import math
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional, Tuple
+
 import torch
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer, util
@@ -9,28 +12,96 @@ from sentence_transformers import SentenceTransformer, util
 from . import config
 
 
+# ---------------------------
+# BM25 (class texts as "docs", review as "query")
+# ---------------------------
+class BM25Indexer:
+    """
+    BM25 indexer over class_texts (documents).
+    Each review is treated as a query; returns score over classes.
+    """
+
+    def __init__(self, docs: List[str], k1: float = 1.5, b: float = 0.75):
+        self.k1 = float(k1)
+        self.b = float(b)
+
+        self.docs_tokens: List[List[str]] = [self.tokenize(t) for t in docs]
+        self.N = len(self.docs_tokens)
+
+        self.doc_len = [len(toks) for toks in self.docs_tokens]
+        self.avgdl = (sum(self.doc_len) / self.N) if self.N > 0 else 0.0
+
+        # df & postings
+        self.df = defaultdict(int)  # term -> df
+        self.postings = defaultdict(list)  # term -> list[(doc_idx, tf)]
+
+        for di, toks in enumerate(self.docs_tokens):
+            tf = Counter(toks)
+            for term, freq in tf.items():
+                self.postings[term].append((di, freq))
+            for term in tf.keys():
+                self.df[term] += 1
+
+        # idf
+        self.idf = {}
+        for term, df in self.df.items():
+            # Okapi idf (+1 안정화)
+            self.idf[term] = math.log((self.N - df + 0.5) / (df + 0.5) + 1.0)
+
+    @staticmethod
+    def tokenize(text: str) -> List[str]:
+        """
+        간단 토크나이저(영문/숫자/한글 포함).
+        """
+        if not text:
+            return []
+        text = text.lower()
+        return re.findall(r"[0-9a-z가-힣]+", text)
+
+    def get_scores(self, query: str) -> List[float]:
+        """
+        query(str) -> scores(List[float]) length = #classes
+        """
+        if self.N == 0:
+            return []
+
+        q_tokens = self.tokenize(query)
+        if not q_tokens:
+            return [0.0] * self.N
+
+        qtf = Counter(q_tokens)
+        scores = [0.0] * self.N
+
+        for term, qcnt in qtf.items():
+            if term not in self.postings:
+                continue
+            idf = self.idf.get(term, 0.0)
+            for di, tf in self.postings[term]:
+                dl = self.doc_len[di]
+                denom = tf + self.k1 * (1.0 - self.b + self.b * (dl / (self.avgdl + 1e-12)))
+                gain = idf * (tf * (self.k1 + 1.0) / (denom + 1e-12))
+                scores[di] += qcnt * gain
+
+        return scores
+
+
 class SilverLabeler:
     """
-    SBERT-only Silver Labeler
+    SBERT + BM25 Hybrid Silver Labeler
     - Leaf Top-K -> Path Restore -> Best Path 1개 선택
-    - 그리고 최종적으로:
-        root-parent  vs  root-parent-leaf 를 결정할 때
-      "parent 아래 sibling leaf들에 대한 softmax 확률"로 leaf 포함 여부를 판단한다.
+    - sibling softmax 확률로 leaf 포함 여부 결정 (uniform-baseline + delta)
 
-    핵심:
-      p(leaf | siblings under same parent) >= tau_prob  -> leaf 포함
-      else -> leaf 제외 (root-parent만)
-
-    * BM25/lexical, reranker, LLM 확장 없음
+    * 기존 SBERT-only에서:
+      doc_sims = alpha * sbert_sim + (1-alpha) * bm25_norm
+      로 변경
     """
 
     def __init__(self, taxonomy, data_loader, device: str = config.DEVICE):
         self.taxonomy = taxonomy
         self.data_loader = data_loader
-        self.device = device
+        self.device = device  # SBERT encoder device (cuda 가능)
 
         self.leaf_prob_delta = float(getattr(config, "LEAF_PROB_DELTA", 0.20))
-        
 
         # SBERT bi-encoder
         model_name = getattr(config, "SBERT_MODEL_NAME", "all-mpnet-base-v2")
@@ -46,7 +117,9 @@ class SilverLabeler:
 
         # leaf nodes
         self.leaf_ids: List[int] = self._collect_leaf_nodes()
-        self.leaf_ids_tensor = torch.tensor(self.leaf_ids, device=self.device, dtype=torch.long)
+        # silver labeling은 CPU에서 처리(=BM25 결합/전송 오버헤드 최소화)
+        self.tensor_device = "cpu"
+        self.leaf_ids_tensor = torch.tensor(self.leaf_ids, device=self.tensor_device, dtype=torch.long)
 
         # tree vs DAG
         self._is_single_parent_graph = self._check_single_parent_graph()
@@ -65,26 +138,46 @@ class SilverLabeler:
 
         self.sbert_sim_matrix: Optional[torch.Tensor] = None
 
+        # =========================
+        # BM25 + Hybrid 설정
+        # =========================
+        self.use_bm25 = bool(getattr(config, "USE_BM25", True))
+        self.hybrid_alpha = float(getattr(config, "HYBRID_ALPHA", 0.7))  # SBERT weight
+        self.hybrid_alpha = min(max(self.hybrid_alpha, 0.0), 1.0)
+
+        self.bm25_k1 = float(getattr(config, "BM25_K1", 1.5))
+        self.bm25_b = float(getattr(config, "BM25_B", 0.75))
+        self.bm25_norm = getattr(config, "BM25_NORM", "minmax")  # 현재 minmax만 구현
+
+        self._bm25_indexer: Optional[BM25Indexer] = None
+
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
     def run(self):
         """
         1) SBERT similarity matrix 로드/계산
-        2) Leaf Top-K -> best path 1개 선택
-        3) softmax sibling prob로 leaf 포함 여부 결정
-        4) silver label 저장
+        2) (선택) BM25 index 빌드
+        3) Leaf Top-K -> best path 1개 선택
+        4) uniform-baseline softmax sibling prob로 leaf 포함 여부 결정
+        5) silver label 저장
         """
         self.sbert_sim_matrix = self._load_or_build_sbert_similarity()
 
-        print("[SilverLabeler] Mining silver labels (leaf Top-K -> best path -> softmax leaf-include)...")
+        if self.use_bm25:
+            print("[SilverLabeler] Building BM25 index over class texts...")
+            class_texts = self._build_class_texts()
+            self._bm25_indexer = BM25Indexer(class_texts, k1=self.bm25_k1, b=self.bm25_b)
+            print("[SilverLabeler] BM25 index ready.")
+
+        print("[SilverLabeler] Mining silver labels (Leaf Top-K -> best path -> softmax leaf-include)...")
         self._mine_labels(self.sbert_sim_matrix)
 
         torch.save(self.silver_labels, config.SILVER_LABELS_PATH)
         print(f"[SilverLabeler] Silver labels saved to {config.SILVER_LABELS_PATH}")
 
     # ------------------------------------------------------------------
-    # SBERT Similarity
+    # Text builders
     # ------------------------------------------------------------------
     def _build_class_texts(self) -> List[str]:
         """
@@ -100,12 +193,15 @@ class SilverLabeler:
                 text = cname
             class_texts.append(text)
         return class_texts
-        
 
+    # ------------------------------------------------------------------
+    # SBERT Similarity
+    # ------------------------------------------------------------------
     def _load_or_build_sbert_similarity(self) -> torch.Tensor:
         if os.path.exists(self.sbert_sim_path):
             print(f"[SilverLabeler] Loading SBERT similarity matrix from {self.sbert_sim_path}")
-            return torch.load(self.sbert_sim_path, map_location=self.device)
+            sim = torch.load(self.sbert_sim_path, map_location="cpu")
+            return sim
 
         print("[SilverLabeler] Building SBERT similarity matrix (docs x classes)...")
         class_texts = self._build_class_texts()
@@ -127,16 +223,59 @@ class SilverLabeler:
 
         print("   - Computing cosine similarity...")
         sim = util.cos_sim(doc_emb, class_emb)  # [-1, 1]
-        sim = (sim + 1.0) / 2.0                 # [0, 1]로 매핑
+        sim = (sim + 1.0) / 2.0                 # [0, 1]
+        sim = sim.detach().cpu()
 
         torch.save(sim, self.sbert_sim_path)
         print(f"[SilverLabeler] SBERT similarity matrix saved to {self.sbert_sim_path}")
         return sim
 
     # ------------------------------------------------------------------
+    # Hybrid: SBERT + BM25
+    # ------------------------------------------------------------------
+    def _bm25_to_01(self, scores: List[float]) -> torch.Tensor:
+        """
+        BM25 scores(List[float]) -> torch.Tensor([0,1]) shape=(C,)
+        """
+        if not scores:
+            return torch.zeros(self.num_classes, dtype=torch.float32, device=self.tensor_device)
+
+        x = torch.tensor(scores, dtype=torch.float32, device=self.tensor_device)
+
+        # min-max normalization per doc
+        if self.bm25_norm == "minmax":
+            mn = torch.min(x)
+            mx = torch.max(x)
+            if (mx - mn) < 1e-12:
+                return torch.zeros_like(x)
+            return (x - mn) / (mx - mn + 1e-12)
+
+        # fallback
+        mn = torch.min(x)
+        mx = torch.max(x)
+        if (mx - mn) < 1e-12:
+            return torch.zeros_like(x)
+        return (x - mn) / (mx - mn + 1e-12)
+
+    def _get_doc_sims_hybrid(self, doc_idx: int, sbert_row: torch.Tensor) -> torch.Tensor:
+        """
+        sbert_row: (C,) on CPU
+        return: (C,) hybrid score on CPU
+        """
+        if (not self.use_bm25) or (self._bm25_indexer is None):
+            return sbert_row
+
+        review = self.review_texts[doc_idx] if doc_idx < len(self.review_texts) else ""
+        bm25_scores = self._bm25_indexer.get_scores(review)  # length C
+        bm25_01 = self._bm25_to_01(bm25_scores)
+
+        a = self.hybrid_alpha
+        return a * sbert_row + (1.0 - a) * bm25_01
+
+    # ------------------------------------------------------------------
     # Leaf Top-K -> Best Path -> Decide include leaf via softmax prob
     # ------------------------------------------------------------------
-    def _mine_labels(self, sim_matrix: torch.Tensor):
+    def _mine_labels(self, sbert_sim_matrix: torch.Tensor):
         # leaf 후보 top-k
         top_k_leaf = int(getattr(config, "SBERT_LEAF_TOP_K", 30))
 
@@ -148,14 +287,15 @@ class SilverLabeler:
         # leaf 후보 자체 최소 유사도(너무 낮은 leaf는 후보에서도 제외)
         min_leaf_sim = float(getattr(config, "MIN_LEAF_SIM", -1.0))
 
-        # leaf 포함 여부 결정: sibling softmax 확률 임계값
+        # leaf 포함 여부 결정: sibling softmax 확률 임계값 (인자 호환용)
         tau_prob = float(getattr(config, "LEAF_PROB_THRESHOLD", 0.5))
-        temp = float(getattr(config, "LEAF_SOFTMAX_TEMPERATURE", 1.0))  # 1.0이면 기본 softmax
+        temp = float(getattr(config, "LEAF_SOFTMAX_TEMPERATURE", 1.0))
         temp = max(temp, 1e-6)
 
-        num_docs = sim_matrix.shape[0]
+        num_docs = sbert_sim_matrix.shape[0]
         for i in tqdm(range(num_docs), desc="SilverLabeling"):
-            doc_sims = sim_matrix[i]  # (num_classes,)
+            sbert_row = sbert_sim_matrix[i].to(self.tensor_device)  # (C,)
+            doc_sims = self._get_doc_sims_hybrid(i, sbert_row)      # (C,) hybrid
 
             # 1) leaf 대상으로만 top-k 후보 뽑기
             leaf_sims = doc_sims.index_select(0, self.leaf_ids_tensor)  # (num_leaf,)
@@ -166,7 +306,6 @@ class SilverLabeler:
             # 2) 후보 leaf들 중 "경로 점수"가 가장 큰 leaf의 경로 1개 선택
             best_chain: List[int] = []
             best_leaf_id: Optional[int] = None
-            best_leaf_score: float = -1e9
             best_chain_score: float = -1e9
 
             for leaf_id, leaf_score in zip(cand_leaf_ids, top_vals.tolist()):
@@ -180,7 +319,6 @@ class SilverLabeler:
                     best_chain_score = chain_score
                     best_chain = chain
                     best_leaf_id = leaf_id
-                    best_leaf_score = float(leaf_score)
 
             # 3) 라벨 벡터 생성
             label_vec = torch.zeros(self.num_classes, device="cpu")
@@ -190,9 +328,7 @@ class SilverLabeler:
                 continue
 
             # chain에서 root/parent/leaf 추출
-            # (3층이면 보통 [root, parent, leaf])
             if len(best_chain) == 1:
-                # 극단 케이스: root만 있는 경우 -> 자식 중 가장 큰 것 하나 붙여 최소 2개 맞추기
                 root_id = best_chain[0]
                 children = self.taxonomy.get_children(root_id) or []
                 if children:
@@ -210,22 +346,16 @@ class SilverLabeler:
             parent_id = best_chain[-2]
             leaf_id = best_chain[-1]
 
-            # 4) leaf 포함 여부 결정 (softmax prob)
-            #    "parent의 자식들 중 leaf들"에 대해 softmax 확률 계산 후,
-            #    선택된 leaf의 확률이 tau_prob 이상이면 leaf 포함.
+            # 4) leaf 포함 여부 결정 (uniform-baseline softmax prob)
             include_leaf = self._include_leaf_by_softmax_prob(
                 parent_id=parent_id,
                 chosen_leaf_id=leaf_id,
                 doc_sims=doc_sims,
-                tau_prob=tau_prob,
+                tau_prob=tau_prob,          # 호환용
                 temperature=temp
             )
 
-            if include_leaf:
-                chosen_nodes = [root_id, parent_id, leaf_id]
-            else:
-                chosen_nodes = [root_id, parent_id]
-
+            chosen_nodes = [root_id, parent_id, leaf_id] if include_leaf else [root_id, parent_id]
             label_vec[chosen_nodes] = 1.0
             self.silver_labels[self.pids[i]] = label_vec
 
@@ -234,22 +364,18 @@ class SilverLabeler:
         parent_id: int,
         chosen_leaf_id: int,
         doc_sims: torch.Tensor,
-        tau_prob: float,      # <- 기존 인자 유지해도 되지만, 이제 사용 안 함(호환용)
+        tau_prob: float,      # <- 호환용(현재는 baseline+delta 사용)
         temperature: float
     ) -> bool:
         """
         uniform-baseline 정규화:
           p(leaf | siblings) >= 1/n + delta  이면 leaf 포함
-
-        - sibling set = parent의 children 중 leaf만
-        - sibling leaf가 0/1개면 비교가 무의미하므로 True
         """
         children = self.taxonomy.get_children(parent_id) or []
         if not children:
             return True
 
         sibling_leaf_ids = [c for c in children if len(self.taxonomy.get_children(c) or []) == 0]
-
         if chosen_leaf_id not in sibling_leaf_ids:
             return True
 
@@ -279,9 +405,6 @@ class SilverLabeler:
         w_parent: float,
         w_leaf: float
     ) -> float:
-        """
-        chain 점수: root/parent/leaf 가중합
-        """
         if not chain:
             return -1e9
         if len(chain) == 1:
@@ -300,11 +423,6 @@ class SilverLabeler:
     # Chain Restore
     # ------------------------------------------------------------------
     def _get_chain_root_to_leaf(self, leaf_id: int, doc_sims: torch.Tensor) -> List[int]:
-        """
-        leaf_id의 경로를 [root, ..., leaf]로 반환.
-        - 트리(부모 1개)면 캐시 사용
-        - DAG(부모 여러 개)면 doc별로 sim 가장 큰 부모 선택해서 경로 1개로 만든다
-        """
         if self._fixed_chain_cache is not None and leaf_id in self._fixed_chain_cache:
             return self._fixed_chain_cache[leaf_id]
 
@@ -358,9 +476,6 @@ class SilverLabeler:
         return True
 
     def _precompute_fixed_leaf_chains(self) -> Dict[int, List[int]]:
-        """
-        노드당 부모가 최대 1개인 경우: leaf별 root까지 고정 경로 캐싱
-        """
         cache: Dict[int, List[int]] = {}
         for leaf_id in self.leaf_ids:
             chain = [leaf_id]
