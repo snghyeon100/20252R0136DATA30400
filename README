@@ -1,78 +1,52 @@
-Hierarchical Multi-Label Text Classification with Silver Labels and Selective LLM Refinement
-This repository contains the implementation of a hierarchical multi-label text classification (HMTC) system. The task involves assigning review documents to a single valid taxonomy path prefix—either root-parent or root-parent-leaf—within a directed acyclic taxonomy of 531 product classes.
+# HMTC-Refinement: Hierarchical Text Classification
+**Taxonomy Enrichment and LLM-Enhanced Hierarchical Text Classification with Selective Refinement**
 
-Overview
-Due to the absence of gold-labeled training data, this project employs a weakly-supervised pipeline:
-+1
+---
 
+## Overview
+This project implements a weakly-supervised hierarchical text classification (HMTC) method. It combines the structural knowledge of taxonomies with the analytical power of **Google Gemini 1.5**. The system automatically generates silver labels and refines them using a budgeted LLM strategy to achieve high accuracy with minimal supervision.
 
-Silver Labeling: Generating high-confidence pseudo-labels via hybrid semantic-lexical retrieval.
-+4
+---
 
+## ystem Architecture
 
-Taxonomy-Aware Training: Training a Dual-Encoder (SBERT + GNN) model with structural constraints.
-+2
+> ### **Step 1: Silver Label Generation**
+> - **Hybrid Retrieval**: Combines **SBERT** (Semantic) and **BM25** (Lexical) for initial document-class matching.
+> - **Path Restoration**: Restores full taxonomy paths from leaf-node candidates.
+> - **Probability Normalization**: Applies sibling-normalized softmax to determine the optimal path depth.
 
+---
 
-Selective LLM Refinement: Enhancing predictions for ambiguous samples using a budgeted LLM strategy.
+> ### **Step 2: Taxonomy-Aware Training**
+> - **Document Encoder**: BERT-based frozen transformer for robust text representation.
+> - **Class Encoder (GNN)**: A Graph Convolutional Network that refines class embeddings by passing messages across the hierarchy.
+> - **Dual-Loss Objective**: Combines **Taxonomy-Aware BCE** and **Supervised Contrastive Loss**.
 
-System Architecture
-1. Silver Label Generation (silver_labeler.py)
-To bootstrap the model, we generate "Silver Labels" for the training corpus.
+---
 
+> ### **Step 3: Selective LLM Refinement**
+> - **Uncertainty Scoring**: Identifies ambiguous samples using *Margin* and *Leaf Gap* metrics.
+> - **Budgeted Gemini API**: Only the most uncertain samples (Top-N) are sent to **Gemini-1.5-Flash**.
+> - **Candidate Prompting**: Provides the LLM with narrowed candidates to ensure precise path selection.
 
-Hybrid Retrieval: We combine SBERT (semantic context) and BM25 (lexical keyword matching) to compute document-class similarity.
-+2
+---
 
+## Performance Results
+The enforcement of taxonomy constraints and selective refinement yields significant gains.
 
-Path Restoration: Top-K leaf candidates are restored to full root-to-leaf paths using the taxonomy.
+| Method Variant | Micro-F1 Score |
+|:---|:---:|
+| Node-wise Prediction (Baseline) | 0.37 |
+| Constrained Path Decoding | 0.53 |
+| **Selective LLM Refinement (Final)** | **0.60** |
 
+---
 
-Sibling-Normalized Probability: A softmax-based decision determines whether to stop at the parent level or include the leaf based on its relative confidence among siblings.
+## 🛠️ Requirements & Setup
 
-2. Model Architecture (model.py)
-The classifier is a Dual-Encoder designed to jointly represent documents and taxonomy classes.
+### 1. Environment Variables
+Create a `.env` file in the root directory. 
+*(Note: If the file shows an 'AnySign4PC' icon, it is still a plain text file; open it with any code editor.)*
 
-
-Document Encoder: A frozen pretrained Transformer (BERT) with mean-pooling to extract review embeddings.
-+1
-
-
-Class Encoder (GNN): A Graph Convolutional Network that refines class embeddings by passing messages across the taxonomy graph.
-+1
-
-Loss Functions:
-
-
-Taxonomy-Aware BCE: Multi-label loss with masking to ignore non-selected siblings of a positive parent.
-+2
-
-
-Supervised Contrastive Loss: Adds a projection head to cluster documents sharing similar labels in the embedding space.
-
-3. Selective LLM Refinement (trainer.py)
-At inference time, we utilize a "Selective Refinement" strategy to optimize accuracy within a strict API budget.
-
-
-Uncertainty Estimation: The model calculates an uncertainty score using the Margin (score difference between the top-2 paths) and the Leaf Gap (closeness to the inclusion threshold).
-+2
-
-
-Budgeted Selection: Only the top-N most uncertain samples (e.g., 10,000 items) are sent to Gemini-2.5-Flash.
-
-
-Narrowed Candidate Prompting: The LLM is provided with a truncated review and only 2 candidate paths, choosing between parent-only or specific leaf nodes.
-
-
-Results
-Method Variant	Kaggle Score (Micro-F1)
-Node-wise prediction (no constraints)	
-0.37 
-
-Path-prefix formulation + Constrained decoding	
-0.53 
-
-Selective LLM leaf-only refinement (Final)	
-
-0.60
-The implementation achieved significant performance gains by enforcing the single-path nature of product categories.
+```env
+GOOGLE_API_KEY="AIzaSyAC1FTiADVwQZilMpb6_p7AyrpnCEzSNQE"
