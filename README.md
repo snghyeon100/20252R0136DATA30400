@@ -4,7 +4,7 @@
 ---
 
 ## 📝 Overview
-This project implements a weakly-supervised hierarchical text classification (HMTC) method. It combines the structural knowledge of taxonomies with the analytical power of **Google Gemini 1.5**. 
+This project implements a weakly-supervised hierarchical text classification (HMTC) method. It combines the structural knowledge of taxonomies with the analytical power of **Google Gemini 2.5**. 
 
 ---
 
