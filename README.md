@@ -53,8 +53,8 @@ LMS에 제출된 폴더 내의 `.env` 파일을 아래 구조와 같이 최상�
 └── src/                 
     └── trainer.py       <-- (소스 코드 폴더)
 
-### 2. Install Dependencies
+### **2. Install Dependencies**
 pip install -r requirements.txt
 
-### 3. Execution
+### **3. Execution**
 python main.py
