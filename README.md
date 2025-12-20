@@ -43,7 +43,7 @@ This project implements a weakly-supervised hierarchical text classification (HM
 ## 🚀 How to Run (실행 방법)
 
 ### 1. Environment Setup (환경 설정)
-LMS에 제출된 폴더 내의 `.env` 파일을 아래 구조와 같이 최상위 루트 폴더(Root Directory)에 위치시켜 주세요. `.env` 파일이 `src` 폴더 내부가 아닌 **바깥쪽**에 있어야 프로그램이 정상적으로 API 키를 로드할 수 있습니다.
+LMS에 제출된 구글 드라이브 폴더 내의 `.env` 파일을 아래 구조와 같이 최상위 루트 폴더(Root Directory)에 위치시켜 주세요. `.env` 파일이 `src` 폴더 내부가 아닌 **바깥쪽**에 있어야 프로그램이 정상적으로 API 키를 로드할 수 있습니다.
 
 ```text
 20252R0136DATA30400 (Root)
