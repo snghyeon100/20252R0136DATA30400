@@ -52,14 +52,14 @@ LMS에 제출된 폴더 내의 `.env` 파일을 아래 구조와 같이 최상�
 ├── requirements.txt     <-- [의존성 목록]
 └── src/                 
     └── trainer.py       <-- (소스 코드 폴더)
-'''
+```
 
-### 2. Install Dependencies**
-'''bash
+### 2. Install Dependencies
+```bash
 pip install -r requirements.txt
-'''
+```
 
 ### 3. Execution
-'''bash
+```bash
 python main.py
-'''
+```
